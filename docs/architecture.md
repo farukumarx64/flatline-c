@@ -6,7 +6,8 @@ networking, scheduling, failure handling, and recovery behavior can be explained
 and demonstrated with reproducible experiments.
 
 This note describes the intended MVP. The current code consists of executable
-scaffolds; these mechanisms have not been implemented yet.
+scaffolds and a tested protocol header encoder and decoder; scheduling, network
+transport, and recovery have not been implemented yet.
 
 ## Components and ownership
 
@@ -79,8 +80,9 @@ integration, and production authentication or TLS.
 Use C11, POSIX TCP sockets, and `poll()` for portable event multiplexing on macOS
 and Linux, with pthreads where necessary. TCP messages require an explicit wire
 format and buffering for partial reads and writes; raw C structs must not be sent
-as the protocol. Protocol fields and encoding will be specified in the next
-milestone.
+as the protocol. The implemented 12-byte header and its encoding are documented
+in [the protocol specification](protocol.md). TCP stream buffering and payload
+handlers will follow.
 
 Before job execution and persistence are implemented, resolve how workers keep
 sending heartbeats during long computations, how assignment attempts are
