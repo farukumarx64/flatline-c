@@ -5,9 +5,10 @@ unfinished work when a worker fails. The v0.1 goal is a small C11 system whose
 networking, scheduling, failure handling, and recovery behavior can be explained
 and demonstrated with reproducible experiments.
 
-This note describes the intended MVP. The current code consists of executable
-scaffolds and a tested protocol header encoder and decoder; scheduling, network
-transport, and recovery have not been implemented yet.
+This note describes the intended MVP. The current implementation supports a
+tested TCP PING/PONG exchange between the CLI and a coordinator using `poll()`.
+The worker is still a scaffold; scheduling, heartbeats, and recovery have not
+been implemented yet.
 
 ## Components and ownership
 
@@ -81,8 +82,10 @@ Use C11, POSIX TCP sockets, and `poll()` for portable event multiplexing on macO
 and Linux, with pthreads where necessary. TCP messages require an explicit wire
 format and buffering for partial reads and writes; raw C structs must not be sent
 as the protocol. The implemented 12-byte header and its encoding are documented
-in [the protocol specification](protocol.md). TCP stream buffering and payload
-handlers will follow.
+in [the protocol specification](protocol.md). The first empty-payload PING/PONG
+handlers and partial-transfer logic are implemented; see
+[the networking walkthrough](networking.md). Variable-length job payloads will
+require additional stream-parser states.
 
 Before job execution and persistence are implemented, resolve how workers keep
 sending heartbeats during long computations, how assignment attempts are

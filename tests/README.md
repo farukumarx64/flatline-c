@@ -1,11 +1,16 @@
 # Tests
 
-Run the protocol unit tests from the project root:
+Run all tests from the project root:
 
 ```sh
 make test
 make test-sanitize
 ```
+
+These run protocol and socket unit tests written in C plus process integration
+tests using Python 3's standard library. A loopback-capable environment is
+required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
+Use `make test-unit` or `make test-integration` to run one layer separately.
 
 `test_protocol.c` has seven test groups:
 
@@ -26,7 +31,33 @@ make test-sanitize
 The test program exits unsuccessfully at the first failed check and reports the
 test, source line, and expression. Its checks remain active with `NDEBUG` set.
 
-These tests exercise the header layer only. TCP fragmentation, multiple frames
-in one receive buffer, and connection closure during a frame require the future
-transport implementation. Later integration tests will exercise job execution,
-worker failure, and coordinator recovery.
+`test_net.c` has six socket test groups. They use local stream socket pairs and
+child processes to verify fragmented receives, clean EOF versus truncation,
+one total receive deadline despite progress, a 256 KiB send through a constrained
+send buffer, a stalled-send deadline, and handling a disconnected peer without
+SIGPIPE terminating the process. The bulk-send receiver checks every byte
+independently using raw `recv()` calls.
+
+`integration/test_ping.py` starts the real coordinator and invokes the real CLI.
+Its 14 scenarios cover a successful exchange and sequential clients, default
+port behavior, fragmented PING and PONG, repeated/coalesced frames, concurrent
+clients alongside idle/partial peers, half-close handling, truncated requests,
+invalid requests and replies, resets, receive timeout, connection refusal,
+port conflicts, and invalid arguments. Cleanup checks coordinator exit status
+after SIGTERM and captures its logs for failure diagnostics.
+
+By default, the integration harness selects an available port and skips the
+specific default-endpoint check. To run all 14 scenarios, stop any existing
+coordinator on port 9000 and run:
+
+```sh
+make test-integration INTEGRATION_ARGS='--port 9000'
+# Or run the complete sanitizer suite, including the default endpoints:
+make test-sanitize INTEGRATION_ARGS='--port 9000'
+```
+
+When 9000 is selected, the harness starts the coordinator without `--port` and
+also invokes `faultline ping` without `--coordinator` to test both defaults.
+Processes started by the harness are stopped afterward. The coordinator and CLI
+are not yet tested for job execution, worker failure, or persistent recovery;
+those features will add their own integration scenarios.

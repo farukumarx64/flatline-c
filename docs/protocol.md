@@ -1,9 +1,9 @@
 # Faultline wire protocol
 
 The protocol header defines how a receiver identifies a Faultline message and
-determines the number of payload bytes that follow it. Header encoding and
-validation are implemented. TCP transport, stream buffering, and payload
-handlers will be added in the next milestones.
+determines the number of payload bytes that follow it. Header encoding,
+validation, and a TCP exchange for empty-payload PING/PONG are implemented.
+Other message types and variable-length payload handling will follow.
 
 ## Header layout
 
@@ -42,10 +42,16 @@ IDs are rejected. Worker registration, heartbeat, job, and query messages will
 receive explicit IDs when their payload formats are designed. Existing IDs must
 not be renumbered. Enum storage layout is never used as the wire representation.
 
-The header layer checks that a type is recognized and a length is bounded. It
-does not define or validate that type's payload contents. A nonzero length in
-the tests exercises the length field; it does not establish PING/PONG handler
-behavior. Payload rules belong to the upcoming message handlers.
+The header layer checks that a type is recognized and a length is bounded. The
+current message handlers impose an additional rule: PING and PONG must have
+zero-length payloads. The coordinator accepts PING and returns PONG; the CLI
+expects PONG. Wrong-direction messages, nonzero payload declarations, and
+malformed headers terminate that connection without a protocol error response.
+
+Nonzero lengths in the header unit tests exercise the generic length encoding.
+They are not accepted by the current PING/PONG handlers. Connections can carry
+multiple empty PING/PONG exchanges in order; the CLI currently performs one
+exchange per invocation.
 
 ## Byte order and examples
 
@@ -60,15 +66,17 @@ A version 1 PING header with an empty payload is:
    FLIN    |   v1  |  PING |    0 bytes
 ```
 
-A header naming PONG with a declared payload length of 66,051 (`0x00010203`) is:
+For a header-layer encoding example only, a header naming PONG with a declared
+payload length of 66,051 (`0x00010203`) is:
 
 ```text
 46 4c 49 4e | 00 01 | 00 02 | 00 01 02 03
    FLIN    |   v1  |  PONG |  66,051 bytes
 ```
 
-Only headers are shown. A complete frame in the second example would need the
-declared payload bytes after the header.
+Only headers are shown. The second example tests encoding; the current PONG
+handler rejects its nonzero length. Future message types that carry data will
+require the declared payload bytes after the header.
 
 ## C API
 
@@ -83,7 +91,7 @@ enum faultline_protocol_result faultline_header_decode(
     const uint8_t *wire, size_t wire_size, struct faultline_header *header);
 ```
 
-For example, prepare a PING header for future transmission:
+For example, prepare a PING header for transmission:
 
 ```c
 struct faultline_header header = {
@@ -138,24 +146,33 @@ It does not consume a stream buffer or report payload completion.
 ## Relationship to TCP framing
 
 TCP provides a stream of bytes, not one complete message per `recv()` call.
-The future receiver must:
+The general receiving flow is:
 
 1. Accumulate at least 12 bytes without discarding earlier partial input.
 2. Decode the header and reject invalid field values.
 3. Accumulate exactly the declared payload length before dispatching the message.
 4. Retain any bytes belonging to following frames for subsequent parsing.
 
-A short header is incomplete input, not necessarily a malformed message. If a
-connection closes before the header or payload finishes arriving, the transport
-must handle the truncated frame. These functions do not keep partial-read state,
-retry sends, or close connections.
+A short header is incomplete input, not necessarily a malformed message. The
+current coordinator keeps partial headers per connection, and the CLI uses
+`faultline_recv_exact()` to collect a response. Both detect EOF during a header.
+The coordinator reads only the bytes remaining in one 12-byte header, leaving
+any following frames in the socket's receive buffer until it is ready for them.
+It rejects nonzero payload lengths immediately because the current handlers
+require empty payloads.
+
+The header encoding/decoding functions remain independent of transport: they
+do not keep partial-read state, retry sends, or close connections. See
+[the networking walkthrough](networking.md) for that implementation.
 
 ## Verification
 
 Run `make test` for the normal build and `make test-sanitize` for AddressSanitizer
-and UndefinedBehaviorSanitizer. The seven test groups cover literal wire vectors,
+and UndefinedBehaviorSanitizer. The seven header test groups cover literal wire vectors,
 payload boundaries, all header truncation lengths, invalid fields, invalid
 encoder inputs, null arguments, and unaligned buffers with trailing bytes.
 
 Literal expected byte sequences verify conformance independently of round-trip
-tests. Failure cases also check that outputs remain unchanged.
+tests. Failure cases also check that outputs remain unchanged. Socket unit tests
+and process integration tests additionally exercise partial transfers,
+timeouts, concurrent clients, malformed messages, and disconnected peers.
