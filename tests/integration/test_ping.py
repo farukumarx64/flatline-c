@@ -15,6 +15,8 @@ import unittest
 
 PING = bytes.fromhex("46 4c 49 4e 00 01 00 01 00 00 00 00")
 PONG = bytes.fromhex("46 4c 49 4e 00 01 00 02 00 00 00 00")
+# Exercise field boundaries and splits inside each field, in both directions.
+FRAGMENT_SIZES = [(1,) * 12, (3, 5, 4)] + [(cut, 12 - cut) for cut in range(1, 12)]
 BIN_DIR = Path("build/debug")
 TEST_PORT = None
 
@@ -98,6 +100,26 @@ class PingExchangeTests(unittest.TestCase):
         except ConnectionResetError:
             pass
 
+    def assert_waiting_for_more(self, connection):
+        previous_timeout = connection.gettimeout()
+        connection.settimeout(0.05)
+        try:
+            # Data, EOF, or reset all fail: an incomplete frame must stay pending.
+            with self.assertRaises(socket.timeout, msg="Peer acted on an incomplete header"):
+                connection.recv(1)
+        finally:
+            connection.settimeout(previous_timeout)
+
+    def send_fragments(self, connection, frame, sizes):
+        self.assertEqual(sum(sizes), len(frame))
+        offset = 0
+        for size in sizes:
+            connection.sendall(frame[offset:offset + size])
+            offset += size
+            if offset < len(frame):
+                # Withhold the suffix; separate send calls alone can coalesce.
+                self.assert_waiting_for_more(connection)
+
     def fake_peer(self, reply):
         """Run the CLI against a peer with deliberately controlled replies."""
         errors = []
@@ -144,15 +166,25 @@ class PingExchangeTests(unittest.TestCase):
 
     def test_fragmented_ping(self):
         with self.connect() as connection:
-            for byte in PING:
-                connection.sendall(bytes([byte]))
-                time.sleep(0.005)
-            self.assertEqual(receive_exact(connection, 12), PONG)
+            for sizes in FRAGMENT_SIZES:
+                with self.subTest(sizes=sizes):
+                    self.send_fragments(connection, PING, sizes)
+                    self.assertEqual(receive_exact(connection, 12), PONG)
 
     def test_coalesced_and_repeated_frames(self):
         with self.connect() as connection:
             connection.sendall(PING * 3)
             self.assertEqual(receive_exact(connection, 36), PONG * 3)
+            connection.sendall(PING)
+            self.assertEqual(receive_exact(connection, 12), PONG)
+
+    def test_complete_frame_followed_by_partial_frame(self):
+        with self.connect() as connection:
+            connection.sendall(PING + PING[:5])
+            self.assertEqual(receive_exact(connection, 12), PONG)
+            self.assert_waiting_for_more(connection)
+            self.send_fragments(connection, PING[5:], (3, 4))
+            self.assertEqual(receive_exact(connection, 12), PONG)
             connection.sendall(PING)
             self.assertEqual(receive_exact(connection, 12), PONG)
 
@@ -172,10 +204,11 @@ class PingExchangeTests(unittest.TestCase):
             self.assert_closed(connection)
 
     def test_truncated_request_does_not_stop_server(self):
-        with self.connect() as connection:
-            connection.sendall(PING[:6])
-            connection.shutdown(socket.SHUT_WR)
-            self.assert_closed(connection)
+        for size in range(len(PING)):
+            with self.subTest(size=size), self.connect() as connection:
+                connection.sendall(PING[:size])
+                connection.shutdown(socket.SHUT_WR)
+                self.assert_closed(connection)
         self.assert_pong(self.run_cli())
 
     def test_invalid_requests_are_rejected(self):
@@ -200,14 +233,16 @@ class PingExchangeTests(unittest.TestCase):
         self.assert_pong(self.run_cli())
 
     def test_cli_accepts_fragmented_pong(self):
-        def reply(connection, _finished):
-            for byte in PONG:
-                connection.sendall(bytes([byte]))
-                time.sleep(0.005)
-        self.assert_pong(self.fake_peer(reply))
+        for sizes in FRAGMENT_SIZES:
+            with self.subTest(sizes=sizes):
+                self.assert_pong(self.fake_peer(
+                    lambda connection, _done: self.send_fragments(connection, PONG, sizes)
+                ))
 
     def test_cli_rejects_bad_and_incomplete_replies(self):
-        for response in (b"", PONG[:5], PING, b"NOPE" + PONG[4:], PONG[:8] + struct.pack("!I", 1)):
+        responses = [PONG[:size] for size in range(len(PONG))]
+        responses.extend((PING, b"NOPE" + PONG[4:], PONG[:8] + struct.pack("!I", 1)))
+        for response in responses:
             with self.subTest(response=response.hex()):
                 result = self.fake_peer(lambda connection, _done: connection.sendall(response))
                 self.assertEqual(result.returncode, 1, result.stderr)

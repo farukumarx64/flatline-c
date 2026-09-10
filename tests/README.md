@@ -39,15 +39,29 @@ SIGPIPE terminating the process. The bulk-send receiver checks every byte
 independently using raw `recv()` calls.
 
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
-Its 14 scenarios cover a successful exchange and sequential clients, default
+Its 15 scenarios cover a successful exchange and sequential clients, default
 port behavior, fragmented PING and PONG, repeated/coalesced frames, concurrent
 clients alongside idle/partial peers, half-close handling, truncated requests,
 invalid requests and replies, resets, receive timeout, connection refusal,
-port conflicts, and invalid arguments. Cleanup checks coordinator exit status
+port conflicts, invalid arguments, and a complete frame followed by a partial
+frame. Cleanup checks coordinator exit status
 after SIGTERM and captures its logs for failure diagnostics.
 
+Fragmentation checks cover 13 delivery patterns in each direction: one byte at
+a time, an uneven `3 + 5 + 4` split, and all 11 possible two-piece splits of a
+12-byte header. After every non-final fragment, the test withholds the suffix
+and checks that the receiver neither replies nor closes the connection. This
+tests pending input without assuming that separate sends map to separate TCP
+packets or receive calls. Coordinator cases reuse the connection to check that
+receive state resets between frames.
+
+Disconnect cases cover every incomplete header length from 0 through 11 bytes
+for both requests and responses. Another case sends a complete PING plus five
+bytes of the next PING together, expects exactly one PONG, and completes the
+second header in two more pieces before checking a third exchange.
+
 By default, the integration harness selects an available port and skips the
-specific default-endpoint check. To run all 14 scenarios, stop any existing
+specific default-endpoint check. To run all 15 scenarios, stop any existing
 coordinator on port 9000 and run:
 
 ```sh
