@@ -21,7 +21,7 @@ COMMON_SOURCES := $(wildcard src/common/*.c)
 COMMON_OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(COMMON_SOURCES))
 MAIN_OBJECTS := $(BUILD_DIR)/coordinator/main.o \
 	$(BUILD_DIR)/worker/main.o $(BUILD_DIR)/cli/main.o
-TEST_NAMES := test_protocol test_net
+TEST_NAMES := test_protocol test_messages test_net
 TEST_OBJECTS := $(addprefix $(BUILD_DIR)/tests/,$(addsuffix .o,$(TEST_NAMES)))
 OBJECTS := $(COMMON_OBJECTS) $(MAIN_OBJECTS) $(TEST_OBJECTS)
 PROGRAMS := $(BUILD_DIR)/faultline-coordinator \
@@ -39,6 +39,7 @@ test: test-unit test-integration
 
 test-unit: $(TEST_PROGRAMS)
 	./$(BUILD_DIR)/tests/test_protocol
+	./$(BUILD_DIR)/tests/test_messages
 	./$(BUILD_DIR)/tests/test_net
 
 test-integration: all

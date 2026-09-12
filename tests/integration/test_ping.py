@@ -215,7 +215,8 @@ class PingExchangeTests(unittest.TestCase):
         requests = [
             b"NOPE" + PING[4:],
             PING[:4] + b"\x00\x02" + PING[6:],
-            PING[:6] + b"\x00\x03" + PING[8:],
+            PING[:6] + b"\x00\x06" + PING[8:],
+            PING[:6] + b"\x00\x03" + PING[8:],  # Known, but not a PING request.
             PONG,
             PING[:8] + struct.pack("!I", 1),
             PING[:8] + struct.pack("!I", 1048577),
