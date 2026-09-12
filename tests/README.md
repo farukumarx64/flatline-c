@@ -31,6 +31,22 @@ Use `make test-unit` or `make test-integration` to run one layer separately.
 The test program exits unsuccessfully at the first failed check and reports the
 test, source line, and expression. Its checks remain active with `NDEBUG` set.
 
+`test_messages.c` adds seven complete-message test groups:
+
+- Literal complete frames for PING, PONG, WORKER_REGISTER, WORKER_REGISTER_ACK,
+  and HEARTBEAT, including exact payload lengths, unaligned buffers, and guards.
+- Worker IDs 1, 12, `0x01020304`, and `UINT32_MAX` in ACK and HEARTBEAT payloads.
+- Every incomplete prefix of each frame and every insufficient output capacity,
+  including 12 through 15 bytes of messages carrying a 4-byte ID. Truncated inputs
+  use exact-sized allocations for ASan; failed calls preserve outputs and counts.
+- Wrong declared payload lengths, oversized payloads, zero IDs, and invalid
+  headers. Wrong lengths fail before waiting for any payload bytes.
+- Invalid encoder message types and IDs without partial writes.
+- Null required pointers with unchanged remaining outputs.
+- Consecutive registration and ACK frames followed by a partial heartbeat,
+  checking byte-consumption counts and decoding again as the remaining ID bytes
+  arrive. This is a buffer-level test, not a live worker registration exchange.
+
 `test_net.c` has six socket test groups. They use local stream socket pairs and
 child processes to verify fragmented receives, clean EOF versus truncation,
 one total receive deadline despite progress, a 256 KiB send through a constrained
@@ -42,7 +58,8 @@ independently using raw `recv()` calls.
 Its 15 scenarios cover a successful exchange and sequential clients, default
 port behavior, fragmented PING and PONG, repeated/coalesced frames, concurrent
 clients alongside idle/partial peers, half-close handling, truncated requests,
-invalid requests and replies, resets, receive timeout, connection refusal,
+invalid requests and replies (including a recognized WORKER_REGISTER that the
+PING-only coordinator does not yet handle), resets, receive timeout, connection refusal,
 port conflicts, invalid arguments, and a complete frame followed by a partial
 frame. Cleanup checks coordinator exit status
 after SIGTERM and captures its logs for failure diagnostics.

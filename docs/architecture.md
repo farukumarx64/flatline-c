@@ -7,7 +7,9 @@ and demonstrated with reproducible experiments.
 
 This note describes the intended MVP. The current implementation supports a
 tested TCP PING/PONG exchange between the CLI and a coordinator using `poll()`.
-The worker is still a scaffold; scheduling, heartbeats, and recovery have not
+Worker registration and heartbeat wire formats, including worker ID payloads,
+have tested encoders and decoders. The worker is still a scaffold; the live
+registration exchange, scheduling, heartbeat detection, and recovery have not
 been implemented yet.
 
 ## Components and ownership

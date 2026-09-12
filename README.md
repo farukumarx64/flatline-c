@@ -8,7 +8,10 @@ The coordinator and CLI now exchange framed PING/PONG messages over TCP. The
 coordinator handles multiple clients with nonblocking sockets and `poll()`, and
 the shared networking code handles partial transfers and deadlines. Protocol
 unit tests, socket tests, and process integration tests cover the exchange.
-The worker remains a scaffold; job execution and persistence are future work.
+Worker registration, acknowledgment, and heartbeat message formats now have
+tested encoders and decoders, including worker ID payloads. The worker remains
+a scaffold; the live registration exchange, job execution, and persistence are
+future work.
 
 ## Build and run
 
@@ -105,4 +108,5 @@ MVP guarantees, and design decisions still to be resolved. Read
 [the protocol specification](docs/protocol.md) for byte offsets, network byte
 order, validation rules, and the C API. The [networking walkthrough](docs/networking.md)
 explains the PING/PONG exchange, connection state, partial I/O, and deadlines.
-Worker registration and heartbeats are the next major milestone.
+Connecting workers to the coordinator using the new registration messages is
+the next step toward worker IDs and heartbeat-based liveness tracking.
