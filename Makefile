@@ -19,11 +19,12 @@ endif
 
 COMMON_SOURCES := $(wildcard src/common/*.c)
 COMMON_OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(COMMON_SOURCES))
+REGISTRY_OBJECT := $(BUILD_DIR)/coordinator/worker_registry.o
 MAIN_OBJECTS := $(BUILD_DIR)/coordinator/main.o \
 	$(BUILD_DIR)/worker/main.o $(BUILD_DIR)/cli/main.o
-TEST_NAMES := test_protocol test_messages test_net
+TEST_NAMES := test_protocol test_messages test_net test_worker_registry
 TEST_OBJECTS := $(addprefix $(BUILD_DIR)/tests/,$(addsuffix .o,$(TEST_NAMES)))
-OBJECTS := $(COMMON_OBJECTS) $(MAIN_OBJECTS) $(TEST_OBJECTS)
+OBJECTS := $(COMMON_OBJECTS) $(MAIN_OBJECTS) $(TEST_OBJECTS) $(REGISTRY_OBJECT)
 PROGRAMS := $(BUILD_DIR)/faultline-coordinator \
 	$(BUILD_DIR)/faultline-worker $(BUILD_DIR)/faultline
 TEST_PROGRAMS := $(addprefix $(BUILD_DIR)/tests/,$(TEST_NAMES))
@@ -41,6 +42,7 @@ test-unit: $(TEST_PROGRAMS)
 	./$(BUILD_DIR)/tests/test_protocol
 	./$(BUILD_DIR)/tests/test_messages
 	./$(BUILD_DIR)/tests/test_net
+	./$(BUILD_DIR)/tests/test_worker_registry
 
 test-integration: all
 	$(PYTHON) tests/integration/test_ping.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
@@ -48,7 +50,7 @@ test-integration: all
 test-sanitize:
 	$(MAKE) SANITIZE=1 test
 
-$(BUILD_DIR)/faultline-coordinator: $(BUILD_DIR)/coordinator/main.o $(COMMON_OBJECTS)
+$(BUILD_DIR)/faultline-coordinator: $(BUILD_DIR)/coordinator/main.o $(COMMON_OBJECTS) $(REGISTRY_OBJECT)
 	$(CC) $(CFLAGS) $(PROJECT_CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(BUILD_DIR)/faultline-worker: $(BUILD_DIR)/worker/main.o $(COMMON_OBJECTS)
@@ -59,6 +61,8 @@ $(BUILD_DIR)/faultline: $(BUILD_DIR)/cli/main.o $(COMMON_OBJECTS)
 
 $(TEST_PROGRAMS): $(BUILD_DIR)/tests/%: $(BUILD_DIR)/tests/%.o $(COMMON_OBJECTS)
 	$(CC) $(CFLAGS) $(PROJECT_CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD_DIR)/tests/test_worker_registry: $(REGISTRY_OBJECT)
 
 $(BUILD_DIR)/tests/%.o: tests/%.c
 	@mkdir -p $(@D)

@@ -2,7 +2,10 @@
 
 import argparse
 import concurrent.futures
+from contextlib import ExitStack
+import os
 from pathlib import Path
+import re
 import signal
 import socket
 import struct
@@ -15,6 +18,9 @@ import unittest
 
 PING = bytes.fromhex("46 4c 49 4e 00 01 00 01 00 00 00 00")
 PONG = bytes.fromhex("46 4c 49 4e 00 01 00 02 00 00 00 00")
+REGISTER = bytes.fromhex("46 4c 49 4e 00 01 00 03 00 00 00 00")
+REGISTER_ACK_HEADER = bytes.fromhex("46 4c 49 4e 00 01 00 04 00 00 00 04")
+HEARTBEAT_HEADER = bytes.fromhex("46 4c 49 4e 00 01 00 05 00 00 00 04")
 # Exercise field boundaries and splits inside each field, in both directions.
 FRAGMENT_SIZES = [(1,) * 12, (3, 5, 4)] + [(cut, 12 - cut) for cut in range(1, 12)]
 BIN_DIR = Path("build/debug")
@@ -31,7 +37,11 @@ def receive_exact(connection, size):
     return bytes(result)
 
 
-class PingExchangeTests(unittest.TestCase):
+def heartbeat(worker_id):
+    return HEARTBEAT_HEADER + struct.pack("!I", worker_id)
+
+
+class CoordinatorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cli = str((BIN_DIR / "faultline").resolve())
@@ -77,7 +87,8 @@ class PingExchangeTests(unittest.TestCase):
             raise AssertionError("Coordinator did not stop on SIGTERM")
         cls.log.seek(0)
         output = cls.log.read()
-        if code != 0 or "ERROR: AddressSanitizer" in output or "runtime error:" in output:
+        if (code != 0 or "ERROR: AddressSanitizer" in output or
+                "runtime error:" in output or "[ERROR]" in output):
             raise AssertionError(f"Coordinator failed ({code}):\n{output}")
 
     def connect(self):
@@ -105,7 +116,7 @@ class PingExchangeTests(unittest.TestCase):
         connection.settimeout(0.05)
         try:
             # Data, EOF, or reset all fail: an incomplete frame must stay pending.
-            with self.assertRaises(socket.timeout, msg="Peer acted on an incomplete header"):
+            with self.assertRaises(socket.timeout, msg="Peer replied or closed while input was pending"):
                 connection.recv(1)
         finally:
             connection.settimeout(previous_timeout)
@@ -119,6 +130,38 @@ class PingExchangeTests(unittest.TestCase):
             if offset < len(frame):
                 # Withhold the suffix; separate send calls alone can coalesce.
                 self.assert_waiting_for_more(connection)
+
+    def receive_registration_ack(self, connection):
+        reply = receive_exact(connection, 16)
+        self.assertEqual(reply[:12], REGISTER_ACK_HEADER)
+        worker_id = struct.unpack("!I", reply[12:])[0]
+        self.assertGreater(worker_id, 0)
+        return worker_id
+
+    def register_worker(self, connection):
+        connection.sendall(REGISTER)
+        return self.receive_registration_ack(connection)
+
+    def worker_events(self, event, worker_id):
+        # pread leaves the file offset shared with the child's stdout untouched.
+        output = os.pread(self.log.fileno(), os.fstat(self.log.fileno()).st_size, 0).decode()
+        pattern = rf"\b{event} worker_id={worker_id}\b([^\n]*)\n"
+        return [dict(re.findall(r"(\w+)=([^ ]+)", fields))
+                for fields in re.findall(pattern, output)]
+
+    def wait_for_worker_event(self, event, worker_id):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            events = self.worker_events(event, worker_id)
+            if events:
+                return events[-1]
+            time.sleep(0.01)
+        self.fail(f"Missing {event} for worker {worker_id}")
+
+    def send_heartbeat_and_ping(self, connection, worker_id):
+        # The following PONG proves the preceding heartbeat was fully processed.
+        connection.sendall(heartbeat(worker_id) + PING)
+        self.assertEqual(receive_exact(connection, 12), PONG)
 
     def fake_peer(self, reply):
         """Run the CLI against a peer with deliberately controlled replies."""
@@ -216,7 +259,6 @@ class PingExchangeTests(unittest.TestCase):
             b"NOPE" + PING[4:],
             PING[:4] + b"\x00\x02" + PING[6:],
             PING[:6] + b"\x00\x06" + PING[8:],
-            PING[:6] + b"\x00\x03" + PING[8:],  # Known, but not a PING request.
             PONG,
             PING[:8] + struct.pack("!I", 1),
             PING[:8] + struct.pack("!I", 1048577),
@@ -274,6 +316,145 @@ class PingExchangeTests(unittest.TestCase):
                 result = subprocess.run(command, capture_output=True, text=True, timeout=3)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertTrue(result.stderr)
+
+    def test_worker_multiple_registrations_and_heartbeats(self):
+        with ExitStack() as stack:
+            connections = [stack.enter_context(self.connect()) for _ in range(3)]
+            ids = [self.register_worker(connection) for connection in connections]
+            self.assertEqual(len(set(ids)), 3)
+            self.assert_pong(self.run_cli())
+            for connection, worker_id in zip(connections, ids):
+                registered = self.wait_for_worker_event("worker_registered", worker_id)
+                self.assertEqual(registered["state"], "ALIVE")
+                self.send_heartbeat_and_ping(connection, worker_id)
+                events = self.worker_events("heartbeat_received", worker_id)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["fd"], registered["fd"])
+                self.assertGreaterEqual(int(events[0]["last_heartbeat_ms"]),
+                                        int(registered["last_heartbeat_ms"]))
+
+    def test_worker_fragmented_registration(self):
+        with self.connect() as connection:
+            self.send_fragments(connection, REGISTER, (1,) * 12)
+            worker_id = self.receive_registration_ack(connection)
+            self.send_heartbeat_and_ping(connection, worker_id)
+
+    def test_worker_fragmented_heartbeat_payload(self):
+        with self.connect() as connection:
+            worker_id = self.register_worker(connection)
+            frame = heartbeat(worker_id)
+            for completed, cut in enumerate(range(1, 16)):
+                with self.subTest(cut=cut):
+                    connection.sendall(frame[:cut])
+                    self.assert_waiting_for_more(connection)
+                    self.assertEqual(len(self.worker_events("heartbeat_received", worker_id)),
+                                     completed)
+                    self.assert_pong(self.run_cli())
+                    connection.sendall(frame[cut:] + PING)
+                    self.assertEqual(receive_exact(connection, 12), PONG)
+                    self.assertEqual(len(self.worker_events("heartbeat_received", worker_id)),
+                                     completed + 1)
+
+    def test_worker_registration_coalesced_with_ping_and_half_close(self):
+        with self.connect() as connection:
+            connection.sendall(REGISTER + PING)
+            connection.shutdown(socket.SHUT_WR)
+            worker_id = self.receive_registration_ack(connection)
+            self.assertEqual(receive_exact(connection, 12), PONG)
+            self.assert_closed(connection)
+            dead = self.wait_for_worker_event("worker_dead", worker_id)
+            self.assertEqual(dead["state"], "DEAD")
+
+    def test_worker_disconnect_and_registration_churn(self):
+        previous_id = 0
+        # More registrations than registry slots proves disconnects release capacity.
+        for _ in range(70):
+            with self.connect() as connection:
+                worker_id = self.register_worker(connection)
+                self.assertGreater(worker_id, previous_id)
+                registered = self.wait_for_worker_event("worker_registered", worker_id)
+            dead = self.wait_for_worker_event("worker_dead", worker_id)
+            self.assertEqual(dead["fd"], registered["fd"])
+            self.assertEqual(dead["last_heartbeat_ms"], registered["last_heartbeat_ms"])
+            self.assertEqual(dead["state"], "DEAD")
+            previous_id = worker_id
+
+    def test_worker_heartbeat_identity_is_bound_to_connection(self):
+        with self.connect() as owner:
+            owner_id = self.register_worker(owner)
+            with self.connect() as unregistered:
+                unregistered.sendall(heartbeat(owner_id))
+                self.assert_closed(unregistered)
+            with self.connect() as other:
+                other_id = self.register_worker(other)
+                other.sendall(heartbeat(owner_id))
+                self.assert_closed(other)
+                self.wait_for_worker_event("worker_dead", other_id)
+            self.assertEqual(self.worker_events("heartbeat_received", owner_id), [])
+            self.assertEqual(self.worker_events("worker_dead", owner_id), [])
+            self.send_heartbeat_and_ping(owner, owner_id)
+            self.assertEqual(len(self.worker_events("heartbeat_received", owner_id)), 1)
+
+        self.wait_for_worker_event("worker_dead", owner_id)
+        with self.connect() as replacement:
+            new_id = self.register_worker(replacement)
+            self.assertNotEqual(new_id, owner_id)
+            replacement.sendall(heartbeat(owner_id))
+            self.assert_closed(replacement)
+            self.wait_for_worker_event("worker_dead", new_id)
+            self.assertEqual(self.worker_events("heartbeat_received", new_id), [])
+
+    def test_worker_duplicate_registration(self):
+        with self.connect() as connection:
+            worker_id = self.register_worker(connection)
+            connection.sendall(REGISTER)
+            self.assert_closed(connection)
+            self.wait_for_worker_event("worker_dead", worker_id)
+        with self.connect() as replacement:
+            self.assertEqual(self.register_worker(replacement), worker_id + 1)
+
+    def test_worker_truncated_and_invalid_frames_mark_dead(self):
+        for size in range(16):
+            with self.subTest(size=size), self.connect() as connection:
+                worker_id = self.register_worker(connection)
+                connection.sendall(heartbeat(worker_id)[:size])
+                connection.shutdown(socket.SHUT_WR)
+                self.assert_closed(connection)
+                self.wait_for_worker_event("worker_dead", worker_id)
+                self.assertEqual(self.worker_events("heartbeat_received", worker_id), [])
+        bad_frames = [
+            heartbeat(0), PONG, REGISTER_ACK_HEADER + struct.pack("!I", 1),
+            HEARTBEAT_HEADER[:8] + struct.pack("!I", 3),
+            HEARTBEAT_HEADER[:8] + struct.pack("!I", 5),
+            REGISTER[:8] + struct.pack("!I", 1),
+        ]
+        for frame in bad_frames:
+            with self.subTest(frame=frame.hex()), self.connect() as connection:
+                worker_id = self.register_worker(connection)
+                connection.sendall(frame)
+                self.assert_closed(connection)
+                self.wait_for_worker_event("worker_dead", worker_id)
+                self.assertEqual(self.worker_events("heartbeat_received", worker_id), [])
+
+    def test_worker_idle_connection_and_stalled_payload(self):
+        with self.connect() as idle, self.connect() as partial:
+            idle_id = self.register_worker(idle)
+            partial_id = self.register_worker(partial)
+            idle_start = self.wait_for_worker_event("worker_registered", idle_id)
+            partial_start = self.wait_for_worker_event("worker_registered", partial_id)
+            partial.sendall(heartbeat(partial_id)[:14])
+            self.assert_waiting_for_more(partial)
+            partial.settimeout(7)
+            self.assert_closed(partial)
+            dead = self.wait_for_worker_event("worker_dead", partial_id)
+            self.assertEqual(dead["reason"], "io_timeout")
+            self.assertEqual(dead["last_heartbeat_ms"], partial_start["last_heartbeat_ms"])
+            # Idle registered workers await the future heartbeat timeout policy.
+            idle.sendall(PING)
+            self.assertEqual(receive_exact(idle, 12), PONG)
+            self.assertEqual(self.worker_events("heartbeat_received", idle_id), [])
+        idle_dead = self.wait_for_worker_event("worker_dead", idle_id)
+        self.assertEqual(idle_dead["last_heartbeat_ms"], idle_start["last_heartbeat_ms"])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 #include "net.h"
 #include "protocol.h"
+#include "worker_registry.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -11,16 +13,21 @@
 #include <unistd.h>
 
 #define MAX_CLIENTS 64
+#define CLIENT_FRAME_CAPACITY (FAULTLINE_HEADER_SIZE + FAULTLINE_WORKER_REGISTER_ACK_PAYLOAD_SIZE)
 
-enum client_phase { READING_PING, WRITING_PONG };
+enum client_phase { READING_MESSAGE, WRITING_REPLY };
 
 struct client {
     int fd;
     enum client_phase phase;
-    uint8_t input[FAULTLINE_HEADER_SIZE];
-    uint8_t output[FAULTLINE_HEADER_SIZE];
+    uint32_t worker_id;
+    uint8_t input[CLIENT_FRAME_CAPACITY];
+    uint8_t output[CLIENT_FRAME_CAPACITY];
     size_t received;
+    size_t expected;
     size_t sent;
+    size_t output_size;
+    uint16_t reply_type;
     int64_t last_progress_ms;
 };
 
@@ -32,86 +39,181 @@ static void request_stop(int signal_number)
     stopping = 1;
 }
 
-static void close_client(struct client *client)
+static void close_client(struct client *client,
+                          struct faultline_worker_registry *registry,
+                          const char *reason)
 {
+    if (client->worker_id != FAULTLINE_WORKER_ID_UNASSIGNED) {
+        enum faultline_registry_result result =
+            faultline_worker_mark_dead(registry, client->worker_id, client->fd);
+
+        if (result == FAULTLINE_REGISTRY_OK) {
+            const struct faultline_worker *worker =
+                faultline_worker_find(registry, client->worker_id);
+            printf("[INFO] coordinator worker_dead worker_id=%" PRIu32
+                   " fd=%d state=DEAD last_heartbeat_ms=%" PRId64 " reason=%s\n",
+                   worker->id, client->fd, worker->last_heartbeat_ms, reason);
+        } else {
+            fprintf(stderr, "[ERROR] coordinator registry_disconnect_failed code=%d\n",
+                    (int)result);
+        }
+    }
+    /* Detach the worker before close() allows the OS to reuse this descriptor. */
     (void)close(client->fd);
     client->fd = -1;
+    client->worker_id = FAULTLINE_WORKER_ID_UNASSIGNED;
 }
 
-static void read_ping(struct client *client, int64_t now)
+static void reset_input(struct client *client)
+{
+    client->received = 0;
+    client->expected = FAULTLINE_HEADER_SIZE;
+    client->phase = READING_MESSAGE;
+}
+
+static void queue_reply(struct client *client,
+                         struct faultline_worker_registry *registry,
+                         uint16_t message_type, uint32_t worker_id)
+{
+    const struct faultline_message reply = {message_type, worker_id};
+
+    if (faultline_message_encode(client->output, sizeof(client->output), &reply,
+                                 &client->output_size) != FAULTLINE_PROTOCOL_OK) {
+        fputs("[ERROR] coordinator could not encode reply\n", stderr);
+        close_client(client, registry, "encode_error");
+        return;
+    }
+    client->sent = 0;
+    client->reply_type = message_type;
+    client->phase = WRITING_REPLY;
+}
+
+static void handle_message(struct client *client,
+                            struct faultline_worker_registry *registry,
+                            const struct faultline_message *message, int64_t now)
+{
+    enum faultline_registry_result result;
+
+    switch (message->message_type) {
+    case FAULTLINE_MSG_PING:
+        printf("[INFO] coordinator ping_received fd=%d\n", client->fd);
+        queue_reply(client, registry, FAULTLINE_MSG_PONG, 0);
+        break;
+    case FAULTLINE_MSG_WORKER_REGISTER:
+        result = faultline_worker_register(registry, client->fd, now, &client->worker_id);
+        if (result != FAULTLINE_REGISTRY_OK) {
+            fprintf(stderr, "[WARN] coordinator registration_rejected fd=%d code=%d\n",
+                    client->fd, (int)result);
+            close_client(client, registry, "registration_rejected");
+            return;
+        }
+        printf("[INFO] coordinator worker_registered worker_id=%" PRIu32
+               " fd=%d state=ALIVE last_heartbeat_ms=%" PRId64 "\n",
+               client->worker_id, client->fd, now);
+        queue_reply(client, registry, FAULTLINE_MSG_WORKER_REGISTER_ACK, client->worker_id);
+        break;
+    case FAULTLINE_MSG_HEARTBEAT:
+        if (client->worker_id == FAULTLINE_WORKER_ID_UNASSIGNED ||
+            message->worker_id != client->worker_id) {
+            close_client(client, registry, "heartbeat_identity_mismatch");
+            return;
+        }
+        result = faultline_worker_heartbeat(registry, message->worker_id, client->fd, now);
+        if (result != FAULTLINE_REGISTRY_OK) {
+            close_client(client, registry, "heartbeat_rejected");
+            return;
+        }
+        printf("[INFO] coordinator heartbeat_received worker_id=%" PRIu32
+               " fd=%d last_heartbeat_ms=%" PRId64 "\n",
+               client->worker_id, client->fd, now);
+        reset_input(client);
+        break;
+    default:
+        close_client(client, registry, "unexpected_message");
+        break;
+    }
+}
+
+static void read_message(struct client *client,
+                          struct faultline_worker_registry *registry, int64_t now)
 {
     ssize_t count = recv(client->fd, client->input + client->received,
-                            sizeof(client->input) - client->received, 0);
-    struct faultline_header header;
+                            client->expected - client->received, 0);
+    struct faultline_message message;
     enum faultline_protocol_result result;
+    size_t consumed;
 
     if (count == 0) {
         if (client->received != 0) {
-            fprintf(stderr, "[WARN] coordinator truncated_header fd=%d bytes=%zu\n",
+            fprintf(stderr, "[WARN] coordinator truncated_message fd=%d bytes=%zu\n",
                     client->fd, client->received);
         }
-        close_client(client);
+        close_client(client, registry, client->received == 0 ? "eof" : "truncated_message");
         return;
     }
     if (count < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             perror("coordinator: recv");
-            close_client(client);
+            close_client(client, registry, "recv_error");
         }
         return;
     }
     client->received += (size_t)count;
     client->last_progress_ms = now;
-    if (client->received < sizeof(client->input)) {
+    if (client->received < client->expected) {
         return;
     }
 
-    result = faultline_header_decode(client->input, sizeof(client->input), &header);
+    result = faultline_message_decode(client->input, client->received, &message, &consumed);
+    if (result == FAULTLINE_PROTOCOL_BUFFER_TOO_SMALL) {
+        struct faultline_header header;
+
+        /* The complete header declares a valid payload we have not read yet. */
+        if (faultline_header_decode(client->input, client->received, &header) !=
+            FAULTLINE_PROTOCOL_OK ||
+            header.payload_length > sizeof(client->input) - FAULTLINE_HEADER_SIZE) {
+            close_client(client, registry, "unsupported_payload");
+            return;
+        }
+        client->expected = FAULTLINE_HEADER_SIZE + (size_t)header.payload_length;
+        return;
+    }
     if (result != FAULTLINE_PROTOCOL_OK) {
-        fprintf(stderr, "[WARN] coordinator invalid_header fd=%d code=%d\n",
+        fprintf(stderr, "[WARN] coordinator invalid_message fd=%d code=%d\n",
                 client->fd, (int)result);
-        close_client(client);
+        close_client(client, registry, "invalid_message");
         return;
     }
-    if (header.message_type != FAULTLINE_MSG_PING || header.payload_length != 0) {
-        fprintf(stderr, "[WARN] coordinator expected_empty_ping fd=%d\n", client->fd);
-        close_client(client);
-        return;
-    }
-    header.message_type = FAULTLINE_MSG_PONG;
-    if (faultline_header_encode(client->output, sizeof(client->output), &header) !=
-        FAULTLINE_PROTOCOL_OK) {
-        fputs("[ERROR] coordinator could not encode PONG\n", stderr);
-        close_client(client);
-        return;
-    }
-    client->sent = 0;
-    client->phase = WRITING_PONG;
-    printf("[INFO] coordinator ping_received fd=%d\n", client->fd);
+    handle_message(client, registry, &message, now);
 }
 
-static void write_pong(struct client *client, int64_t now)
+static void write_reply(struct client *client,
+                         struct faultline_worker_registry *registry, int64_t now)
 {
     ssize_t count = send(client->fd, client->output + client->sent,
-                         sizeof(client->output) - client->sent, 0);
+                         client->output_size - client->sent, 0);
 
     if (count < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             perror("coordinator: send");
-            close_client(client);
+            close_client(client, registry, "send_error");
         }
         return;
     }
     if (count == 0) {
-        close_client(client);
+        close_client(client, registry, "send_closed");
         return;
     }
     client->sent += (size_t)count;
     client->last_progress_ms = now;
-    if (client->sent == sizeof(client->output)) {
-        printf("[INFO] coordinator pong_sent fd=%d\n", client->fd);
-        client->received = 0;
-        client->phase = READING_PING;
+    if (client->sent == client->output_size) {
+        if (client->reply_type == FAULTLINE_MSG_PONG) {
+            printf("[INFO] coordinator pong_sent fd=%d\n", client->fd);
+        } else {
+            printf("[INFO] coordinator worker_register_ack_sent worker_id=%" PRIu32
+                   " fd=%d\n", client->worker_id, client->fd);
+        }
+        reset_input(client);
     }
 }
 
@@ -145,7 +247,8 @@ static void accept_clients(int listener, struct client clients[MAX_CLIENTS],
             (void)close(fd);
         } else {
             clients[slot] = (struct client){
-                .fd = fd, .phase = READING_PING, .last_progress_ms = now
+                .fd = fd, .phase = READING_MESSAGE, .expected = FAULTLINE_HEADER_SIZE,
+                .last_progress_ms = now
             };
             printf("[INFO] coordinator client_connected fd=%d\n", fd);
         }
@@ -154,10 +257,12 @@ static void accept_clients(int listener, struct client clients[MAX_CLIENTS],
 
 static int run_coordinator(int listener)
 {
+    struct faultline_worker_registry registry;
     struct client clients[MAX_CLIENTS];
     struct pollfd descriptors[MAX_CLIENTS + 1];
     int status = EXIT_SUCCESS;
 
+    faultline_worker_registry_init(&registry);
     for (size_t i = 0; i < MAX_CLIENTS; ++i) {
         clients[i] = (struct client){.fd = -1};
     }
@@ -169,7 +274,7 @@ static int run_coordinator(int listener)
         for (size_t i = 0; i < MAX_CLIENTS; ++i) {
             descriptors[i + 1] = (struct pollfd){
                 .fd = clients[i].fd,
-                .events = clients[i].phase == READING_PING ? POLLIN : POLLOUT
+                .events = clients[i].phase == READING_MESSAGE ? POLLIN : POLLOUT
             };
         }
         ready = poll(descriptors, MAX_CLIENTS + 1, 1000);
@@ -194,21 +299,23 @@ static int run_coordinator(int listener)
                 continue;
             }
             if ((events & POLLNVAL) != 0) {
-                close_client(&clients[i]);
+                close_client(&clients[i], &registry, "invalid_descriptor");
                 continue;
             }
-            if (clients[i].phase == READING_PING &&
+            if (clients[i].phase == READING_MESSAGE &&
                 (events & (POLLIN | POLLHUP | POLLERR)) != 0) {
-                read_ping(&clients[i], now);
-            } else if (clients[i].phase == WRITING_PONG &&
+                read_message(&clients[i], &registry, now);
+            } else if (clients[i].phase == WRITING_REPLY &&
                        (events & (POLLOUT | POLLHUP | POLLERR)) != 0) {
-                write_pong(&clients[i], now);
+                write_reply(&clients[i], &registry, now);
             }
             if (clients[i].fd >= 0 &&
+                (clients[i].worker_id == FAULTLINE_WORKER_ID_UNASSIGNED ||
+                 clients[i].phase == WRITING_REPLY || clients[i].received != 0) &&
                 now - clients[i].last_progress_ms >= FAULTLINE_IO_TIMEOUT_MS) {
                 fprintf(stderr, "[WARN] coordinator client_timeout fd=%d\n",
                         clients[i].fd);
-                close_client(&clients[i]);
+                close_client(&clients[i], &registry, "io_timeout");
             }
         }
         if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
@@ -222,7 +329,7 @@ static int run_coordinator(int listener)
     }
     for (size_t i = 0; i < MAX_CLIENTS; ++i) {
         if (clients[i].fd >= 0) {
-            close_client(&clients[i]);
+            close_client(&clients[i], &registry, "shutdown");
         }
     }
     return status;
