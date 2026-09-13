@@ -3,7 +3,8 @@
 Faultline can now start a coordinator on `127.0.0.1:9000`, accept a CLI connection,
 receive a binary PING header, and send a binary PONG header. The coordinator also
 accepts registration and heartbeat frames and owns a [worker registry](workers.md).
-The worker executable's networking and job scheduling are still to come.
+The worker executable connects and registers through the same protocol. Periodic
+worker heartbeats and job scheduling are still to come.
 
 ## Run it
 
@@ -32,10 +33,11 @@ shutdown, closes all client sockets and the listener, and exits the event loop.
 | File | Responsibility |
 | --- | --- |
 | `include/net.h` | Networking API, defaults, and receive result codes. |
-| `src/common/net.c` | Socket setup, port parsing, readiness waits, deadlines, and complete-transfer helpers. |
+| `src/common/net.c` | Socket setup, endpoint/port parsing, readiness waits, deadlines, and complete-transfer helpers. |
 | `src/coordinator/main.c` | Listener, client slots, poll loop, frame handling, queued replies, and registry integration. |
 | `include/worker_registry.h`, `src/coordinator/worker_registry.c` | Coordinator-owned IDs, connections, liveness states, and heartbeat timestamps. |
 | `src/cli/main.c` | CLI arguments, one connection, request transmission, and response validation. |
+| `src/worker/main.c` | Worker arguments, registration request/ACK, retained connection, and shutdown. |
 
 `protocol.h` and `protocol.c` own the 12-byte header and complete-message formats.
 Networking uses their encoders and decoders; it does not send raw C structs.
@@ -51,7 +53,11 @@ does not permit a second live coordinator to claim the same listening address.
 The listening socket remains responsible for accepting new connections. Each
 accepted socket is explicitly made nonblocking and placed in a client slot.
 
-The CLI creates its own nonblocking socket and calls `connect()`. Connection
+The CLI and worker use `faultline_parse_endpoint()` for their optional numeric
+IPv4:PORT argument. It validates the address and port and leaves both outputs
+unchanged on error. Names such as `localhost` and IPv6 addresses are not accepted.
+
+Each creates its own nonblocking socket through `faultline_connect()`. Connection
 establishment may still be in progress, reported as `EINPROGRESS`. It waits for
 writability with `poll()` and checks `SO_ERROR` before treating the connection
 as successful. Writability alone does not establish that connection succeeded.
@@ -59,6 +65,29 @@ as successful. Writability alone does not establish that connection succeeded.
 The socket address's port uses `htons()`. That conversion belongs to the POSIX
 socket-address API; the protocol header encoder separately handles the header's
 byte order. Numeric IPv4 addresses are parsed with `inet_pton()`.
+
+## Worker registration and waiting
+
+The worker sends an empty WORKER_REGISTER using the complete-message encoder
+and `faultline_send_all()`. It then collects the ACK in a fixed 16-byte buffer:
+first 12 bytes for the header, followed by four bytes for the worker ID. A wrong
+header, message type, or payload length is rejected before waiting for payload
+bytes. The complete-message decoder validates the final frame, including the
+nonzero ID. Only then does the worker print `worker registered worker_id=...`.
+
+The ACK receive loop keeps its byte count across partial reads. It uses `poll()`
+with a maximum 250 ms wait so SIGINT/SIGTERM can stop it promptly, including a
+signal arriving just before a wait. The handler only sets a `sig_atomic_t` flag;
+ordinary code performs cleanup. This loop has one five-second deadline covering
+both header and payload, even if bytes continue arriving slowly.
+
+After registration, the worker retains the socket and ID and waits for a stop
+request or coordinator activity. There is no idle timeout at this stage. It
+does not send heartbeats yet. EOF, reset, or unexpected incoming bytes produce
+an error and a failure exit; future job handling will replace that last case.
+The worker reads exactly the ACK size so additional bytes cannot be silently
+swallowed by the registration receive loop. Local SIGINT/SIGTERM requests close
+the socket and produce a successful exit. There is no automatic reconnect loop.
 
 ## The coordinator event loop
 
@@ -138,6 +167,11 @@ receiving the whole response. Each operation keeps one deadline across retries
 and partial progress. These are separate operation budgets, not a five-second
 budget for the entire invocation.
 
+The worker similarly allows five seconds to connect, five seconds to send the
+registration, and one five-second deadline for the whole ACK. Its ACK receive
+loop and idle wait are interruptible; the shared connect/send helpers may finish
+their current bounded operation before honoring a local stop request.
+
 The coordinator applies a five-second inactivity limit to unregistered clients,
 partial incoming messages, and queued replies, measured since acceptance or the
 last successful read/write. The poll loop checks this approximately once per
@@ -163,7 +197,7 @@ connection without an error frame. Every registered-client close path marks its
 worker DEAD and detaches the descriptor before calling `close()`, including
 EOF, I/O errors, protocol rejection, stalled transfers, and coordinator shutdown.
 
-The coordinator currently listens only on IPv4 loopback. The CLI accepts a
+The coordinator currently listens only on IPv4 loopback. The CLI and worker accept a
 numeric IPv4 address. There is no hostname resolution, IPv6, automatic worker
 heartbeat sending, missed-heartbeat detection, job execution, or persistence yet.
 Logs provide basic event

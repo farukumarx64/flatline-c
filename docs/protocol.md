@@ -6,8 +6,9 @@ validation, complete-message encoding/decoding, and a TCP exchange for
 empty-payload PING/PONG are implemented. Worker registration, its acknowledgment,
 and heartbeat formats are defined and tested, including their payload bytes.
 The coordinator accepts registrations, returns assigned IDs, and records valid
-heartbeats. The worker executable does not send these messages yet; integration
-tests use independent TCP peers to exercise the coordinator.
+heartbeats. The worker executable sends WORKER_REGISTER, validates the ACK header
+and ID payload, and retains its assigned ID while connected. Periodic HEARTBEAT
+sending is still to come. Integration tests also use independent TCP peers.
 
 ## Header layout
 

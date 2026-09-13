@@ -47,12 +47,18 @@ test, source line, and expression. Its checks remain active with `NDEBUG` set.
   checking byte-consumption counts and decoding again as the remaining ID bytes
   arrive. This is a buffer-level test, not a live worker registration exchange.
 
-`test_net.c` has six socket test groups. They use local stream socket pairs and
-child processes to verify fragmented receives, clean EOF versus truncation,
+`test_net.c` has six socket test groups and one endpoint-parsing group. Socket
+tests use local stream socket pairs and child processes to verify fragmented
+receives, clean EOF versus truncation,
 one total receive deadline despite progress, a 256 KiB send through a constrained
 send buffer, a stalled-send deadline, and handling a disconnected peer without
 SIGPIPE terminating the process. The bulk-send receiver checks every byte
 independently using raw `recv()` calls.
+
+Endpoint tests cover numeric IPv4 addresses, port boundaries, malformed inputs,
+unsupported hostname/IPv6 inputs, null arguments, and insufficient host buffers.
+Failed parsing leaves the host and port outputs unchanged. Both the CLI and
+worker use this shared parser.
 
 `test_worker_registry.c` has six groups covering registration and lookup,
 heartbeat ownership and monotonic time, disconnect and descriptor reuse,
@@ -95,8 +101,29 @@ for both requests and responses. Another case sends a complete PING plus five
 bytes of the next PING together, expects exactly one PONG, and completes the
 second header in two more pieces before checking a third exchange.
 
-By default, the integration harness selects an available port and skips the
-specific default-endpoint check. To run all 24 scenarios, stop any existing
+`integration/test_worker.py` adds eight scenarios for the real worker executable:
+
+- Two workers running simultaneously with distinct coordinator-issued IDs;
+  stopping one leaves the other registered and the CLI usable.
+- The default worker endpoint on port 9000.
+- Seventeen ACK fragment patterns: one byte at a time, `3 + 5 + 4 + 4`, and all
+  15 two-part splits. The worker must not report an ID before the full ACK arrives.
+- All 16 incomplete ACK prefixes, malformed headers, wrong types/lengths, and
+  ID zero. Invalid headers are tested while the peer remains open, proving early rejection.
+- A single five-second ACK deadline across delayed header and payload fragments.
+- SIGINT/SIGTERM during an incomplete ACK.
+- Coordinator EOF/reset and unexpected bytes coalesced after a valid ACK.
+- Help, invalid arguments, and an unavailable endpoint (which may consume the
+  existing five-second connect budget instead of refusing immediately).
+
+The worker suite also verifies decoding/printing `UINT32_MAX`. Both integration
+suites share coordinator setup, cleanup, and protocol helpers through the
+`CoordinatorTestCase` base class; the original coordinator tests run only once.
+Worker subprocesses are always cleaned up, and their stderr is checked for
+AddressSanitizer/UBSan reports.
+
+By default, each integration suite selects an available port and skips its
+specific default-endpoint check. To run all 32 scenarios, stop any existing
 coordinator on port 9000 and run:
 
 ```sh
@@ -106,7 +133,8 @@ make test-sanitize INTEGRATION_ARGS='--port 9000'
 ```
 
 When 9000 is selected, the harness starts the coordinator without `--port` and
-also invokes `faultline ping` without `--coordinator` to test both defaults.
-Processes started by the harness are stopped afterward. The coordinator and CLI
+also invokes `faultline ping` and `faultline-worker` without `--coordinator`
+to test all defaults. Processes started by the harness are stopped afterward.
+The coordinator, CLI, and worker
 are not yet tested for job execution, missed-heartbeat detection, or persistent recovery;
 those features will add their own integration scenarios.

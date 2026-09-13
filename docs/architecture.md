@@ -9,9 +9,10 @@ This note describes the intended MVP. The current implementation supports a
 tested TCP PING/PONG exchange between the CLI and a coordinator using `poll()`.
 The coordinator also registers workers, returns assigned IDs, validates heartbeat
 ownership, and records connection state and heartbeat times in a worker registry.
-Disconnected workers are marked dead. The worker executable is still a scaffold;
-periodic heartbeat sending, missed-heartbeat detection, scheduling, and recovery
-have not been implemented yet.
+Disconnected workers are marked dead. The worker executable now connects,
+registers, validates its assigned ID, and remains connected until stopped or
+disconnected. Periodic heartbeat sending, missed-heartbeat detection, scheduling,
+and recovery have not been implemented yet.
 
 ## Components and ownership
 

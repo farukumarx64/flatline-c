@@ -1,4 +1,4 @@
-# Coordinator worker registry
+# Workers and the coordinator registry
 
 The coordinator accepts WORKER_REGISTER, assigns a worker ID, returns
 WORKER_REGISTER_ACK, and records HEARTBEAT messages from that connection.
@@ -6,9 +6,68 @@ Its registry is in `src/coordinator/worker_registry.c`, with the public interfac
 in `include/worker_registry.h`. The wire format is documented in
 [protocol.md](protocol.md); the event loop is described in [networking.md](networking.md).
 
-The worker executable is still a scaffold. Integration tests and the manual
-example below provide TCP peers. Periodic heartbeat sending, missed-heartbeat
-detection, scheduling, and persistent recovery are not implemented yet.
+The worker executable now connects and registers, reads its assigned ID from
+the acknowledgment, and stays connected. Periodic heartbeat sending,
+missed-heartbeat detection, scheduling, and persistent recovery are not
+implemented yet. Integration tests cover both real workers and controlled peers.
+
+## Run two workers
+
+Build with `make`, then start the coordinator and two workers in separate terminals:
+
+```sh
+# Terminal 1
+./build/debug/faultline-coordinator
+
+# Terminal 2
+./build/debug/faultline-worker
+
+# Terminal 3
+./build/debug/faultline-worker
+```
+
+The first two registrations on a fresh coordinator receive distinct IDs:
+
+```text
+[INFO] worker registered worker_id=1 coordinator=127.0.0.1:9000
+[INFO] worker registered worker_id=2 coordinator=127.0.0.1:9000
+```
+
+The IDs are assigned by registration order, not by terminal or process number.
+Both workers remain connected. Stop either with Ctrl+C; the coordinator marks
+that registration dead while the other stays connected. Each program also handles
+SIGTERM. Output is line-buffered so the registration line appears immediately
+when a worker's output is redirected to a file or captured by a test.
+
+Use `faultline-worker --coordinator IPv4:PORT` to override the default endpoint,
+or `--help` for usage (with the executable path above unless it is on PATH).
+The CLI and worker share endpoint parsing and accept numeric IPv4 addresses
+with port numbers 1 through 65535.
+
+## Worker startup
+
+`src/worker/main.c` performs these steps:
+
+1. Parse arguments and configure signal handling.
+2. Connect through the shared nonblocking socket helper.
+3. Encode and send the 12-byte WORKER_REGISTER frame.
+4. Collect and validate the 12-byte ACK header, then its four ID bytes.
+5. Decode the complete ACK and retain the assigned ID.
+6. Print registration success and wait with the connection open.
+7. Close the socket on a local stop, disconnection, or error.
+
+The worker accepts only WORKER_REGISTER_ACK with a four-byte payload and nonzero
+ID. It does not announce registration after only receiving the header or a
+partial ID. Its receive loop preserves fragments and has one five-second deadline
+for the complete ACK. Invalid headers fail immediately; EOF during the header
+or payload is a failed registration. Connect and send each have their own
+five-second budget.
+
+SIGINT/SIGTERM interrupt the ACK or idle wait promptly; connect/send may finish
+their bounded operation first. A local stop exits successfully. Coordinator
+disconnection, invalid ACKs, or unexpected data after registration exit with
+failure. The worker does not yet send periodic heartbeats, process jobs, or
+automatically reconnect. Its retained ID applies only to this connection.
 
 ## Identity and storage
 
@@ -96,7 +155,7 @@ capacity, ID exhaustion, unknown IDs, dead workers, and connection mismatches.
 Failed operations leave records and registration output unchanged. Socket
 ownership stays with `main.c`; marking a worker dead does not itself close a socket.
 
-## Manual example
+## Manual wire-format peer
 
 Build and start the coordinator in one terminal:
 
@@ -105,8 +164,9 @@ make
 ./build/debug/faultline-coordinator
 ```
 
-Run this Python peer in another terminal to register, print its assigned ID,
-send one heartbeat, and disconnect. It uses only the Python standard library.
+For protocol inspection, this optional Python peer registers, prints its assigned
+ID, sends one heartbeat, and disconnects. It uses only the Python standard library;
+the real worker executable currently registers and waits without sending heartbeats.
 
 ```sh
 python3 - <<'PY'

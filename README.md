@@ -11,8 +11,9 @@ unit tests, socket tests, and process integration tests cover the exchange.
 The coordinator also accepts worker registration, assigns IDs, and tracks each
 worker's connection, liveness state, and last heartbeat time in a bounded registry.
 It checks incoming heartbeat IDs against their connections and marks workers
-dead on disconnect. The worker executable remains a scaffold; automatic heartbeat
-sending, missed-heartbeat detection, job execution, and persistence are future work.
+dead on disconnect. The worker executable now connects, registers, prints its
+assigned ID, and keeps its connection open. Periodic heartbeat sending,
+missed-heartbeat detection, job execution, and persistence are future work.
 
 ## Build and run
 
@@ -38,12 +39,31 @@ Then send a PING from a second terminal:
 # PONG
 ```
 
-Both programs default to `127.0.0.1:9000`, so `faultline-coordinator` and
-`faultline ping` also work without address options. Use the executable paths
+All three programs default to `127.0.0.1:9000`, so `faultline-coordinator`,
+`faultline ping`, and `faultline-worker` work without address options. Use the executable paths
 above unless you have added their directory to PATH. Stop the coordinator with
 Ctrl+C. It closes active connections and its listening socket before exiting.
 
-The coordinator currently binds only to IPv4 loopback. The CLI accepts numeric
+With the coordinator running, start a worker in each of two additional terminals:
+
+```sh
+./build/debug/faultline-worker
+```
+
+Each prints its assigned ID and stays running. On a fresh coordinator, the first
+two registrations get IDs 1 and 2 (process scheduling determines which gets 1):
+
+```text
+[INFO] worker registered worker_id=1 coordinator=127.0.0.1:9000
+[INFO] worker registered worker_id=2 coordinator=127.0.0.1:9000
+```
+
+Use `./build/debug/faultline-worker --coordinator 127.0.0.1:9000` to specify an
+endpoint. Ctrl+C or SIGTERM stops the worker and closes its socket. Unexpected
+coordinator disconnection makes the worker report an error and exit; automatic
+reconnection is not implemented yet.
+
+The coordinator currently binds only to IPv4 loopback. The CLI and worker accept numeric
 IPv4 addresses and ports from 1 through 65535. Hostname resolution, IPv6, and a
 coordinator bind-address option are not implemented yet.
 
@@ -57,7 +77,7 @@ Build with AddressSanitizer and UndefinedBehaviorSanitizer:
 make sanitize
 ```
 
-Run the same two-terminal example using `build/sanitize/` in place of
+Run the same examples using `build/sanitize/` in place of
 `build/debug/`.
 
 Debug symbols and frame pointers make sanitizer reports easier to investigate.
@@ -100,7 +120,7 @@ faultline/
 ├── src/
 │   ├── common/          Shared protocol, networking, and logging code
 │   ├── coordinator/     Event loop and worker registry
-│   ├── worker/          Worker entry point and future implementation
+│   ├── worker/          Worker connection and registration
 │   └── cli/             Client entry point and future implementation
 └── tests/               Protocol/registry/socket unit tests and TCP integration tests
 ```
@@ -110,7 +130,6 @@ MVP guarantees, and design decisions still to be resolved. Read
 [the protocol specification](docs/protocol.md) for byte offsets, network byte
 order, validation rules, and the C API. The [networking walkthrough](docs/networking.md)
 explains the PING/PONG exchange, connection state, partial I/O, and deadlines.
-The [worker registry guide](docs/workers.md) describes worker IDs, connection
-ownership, heartbeat timestamps, and a manual registration example. The next
-step is making the worker executable register and send periodic heartbeats,
-then adding configurable missed-heartbeat detection.
+The [worker guide](docs/workers.md) describes the registration exchange, worker
+IDs, connection ownership, and heartbeat timestamps. The next step is periodic
+heartbeat sending and configurable missed-heartbeat detection.
