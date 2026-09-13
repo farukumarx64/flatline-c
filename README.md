@@ -8,10 +8,11 @@ The coordinator and CLI now exchange framed PING/PONG messages over TCP. The
 coordinator handles multiple clients with nonblocking sockets and `poll()`, and
 the shared networking code handles partial transfers and deadlines. Protocol
 unit tests, socket tests, and process integration tests cover the exchange.
-Worker registration, acknowledgment, and heartbeat message formats now have
-tested encoders and decoders, including worker ID payloads. The worker remains
-a scaffold; the live registration exchange, job execution, and persistence are
-future work.
+The coordinator also accepts worker registration, assigns IDs, and tracks each
+worker's connection, liveness state, and last heartbeat time in a bounded registry.
+It checks incoming heartbeat IDs against their connections and marks workers
+dead on disconnect. The worker executable remains a scaffold; automatic heartbeat
+sending, missed-heartbeat detection, job execution, and persistence are future work.
 
 ## Build and run
 
@@ -93,14 +94,15 @@ faultline/
 ├── docs/
 │   ├── architecture.md
 │   ├── protocol.md
-│   └── networking.md
+│   ├── networking.md
+│   └── workers.md
 ├── include/             Shared C headers
 ├── src/
 │   ├── common/          Shared protocol, networking, and logging code
-│   ├── coordinator/     Coordinator entry point and future implementation
+│   ├── coordinator/     Event loop and worker registry
 │   ├── worker/          Worker entry point and future implementation
 │   └── cli/             Client entry point and future implementation
-└── tests/               Protocol/socket unit tests and TCP integration tests
+└── tests/               Protocol/registry/socket unit tests and TCP integration tests
 ```
 
 Read [the architecture note](docs/architecture.md) for component responsibilities,
@@ -108,5 +110,7 @@ MVP guarantees, and design decisions still to be resolved. Read
 [the protocol specification](docs/protocol.md) for byte offsets, network byte
 order, validation rules, and the C API. The [networking walkthrough](docs/networking.md)
 explains the PING/PONG exchange, connection state, partial I/O, and deadlines.
-Connecting workers to the coordinator using the new registration messages is
-the next step toward worker IDs and heartbeat-based liveness tracking.
+The [worker registry guide](docs/workers.md) describes worker IDs, connection
+ownership, heartbeat timestamps, and a manual registration example. The next
+step is making the worker executable register and send periodic heartbeats,
+then adding configurable missed-heartbeat detection.

@@ -7,7 +7,7 @@ make test
 make test-sanitize
 ```
 
-These run protocol and socket unit tests written in C plus process integration
+These run protocol, registry, and socket unit tests written in C plus process integration
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
@@ -54,15 +54,33 @@ send buffer, a stalled-send deadline, and handling a disconnected peer without
 SIGPIPE terminating the process. The bulk-send receiver checks every byte
 independently using raw `recv()` calls.
 
+`test_worker_registry.c` has six groups covering registration and lookup,
+heartbeat ownership and monotonic time, disconnect and descriptor reuse,
+capacity/duplicate registration/churn, ID exhaustion, and invalid arguments.
+These tests supply descriptor numbers and timestamps directly; no real sockets
+or sleeps are needed. Reusing descriptor 7 is deliberate and deterministic.
+Stale IDs cannot update or kill its replacement worker. Churn exceeds the
+64-slot capacity without replacing live records; exhaustion never wraps to ID 1.
+
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
-Its 15 scenarios cover a successful exchange and sequential clients, default
+Its original 15 scenarios cover a successful exchange and sequential clients, default
 port behavior, fragmented PING and PONG, repeated/coalesced frames, concurrent
 clients alongside idle/partial peers, half-close handling, truncated requests,
-invalid requests and replies (including a recognized WORKER_REGISTER that the
-PING-only coordinator does not yet handle), resets, receive timeout, connection refusal,
+invalid requests and replies, resets, receive timeout, connection refusal,
 port conflicts, invalid arguments, and a complete frame followed by a partial
 frame. Cleanup checks coordinator exit status
 after SIGTERM and captures its logs for failure diagnostics.
+
+Nine additional worker scenarios exercise the real coordinator using independent
+Python TCP peers: simultaneous registered connections, fragmented registration,
+all 15 two-part heartbeat splits, registration plus a coalesced PING and half-close,
+70 successive registrations/disconnects, heartbeat ownership and stale IDs,
+duplicate registration, truncated/invalid worker frames, and an idle registered
+worker alongside a stalled payload. The stalled payload times out and marks its
+worker dead; the idle worker stays connected pending the future heartbeat timeout
+policy. Logs verify state transitions and timestamp updates, including that PING
+and incomplete heartbeat bytes do not count as heartbeats. Positional log reads
+avoid moving the file offset shared with the coordinator's output stream.
 
 Fragmentation checks cover 13 delivery patterns in each direction: one byte at
 a time, an uneven `3 + 5 + 4` split, and all 11 possible two-piece splits of a
@@ -78,7 +96,7 @@ bytes of the next PING together, expects exactly one PONG, and completes the
 second header in two more pieces before checking a third exchange.
 
 By default, the integration harness selects an available port and skips the
-specific default-endpoint check. To run all 15 scenarios, stop any existing
+specific default-endpoint check. To run all 24 scenarios, stop any existing
 coordinator on port 9000 and run:
 
 ```sh
@@ -90,5 +108,5 @@ make test-sanitize INTEGRATION_ARGS='--port 9000'
 When 9000 is selected, the harness starts the coordinator without `--port` and
 also invokes `faultline ping` without `--coordinator` to test both defaults.
 Processes started by the harness are stopped afterward. The coordinator and CLI
-are not yet tested for job execution, worker failure, or persistent recovery;
+are not yet tested for job execution, missed-heartbeat detection, or persistent recovery;
 those features will add their own integration scenarios.

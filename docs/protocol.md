@@ -5,7 +5,9 @@ determines the number of payload bytes that follow it. Header encoding,
 validation, complete-message encoding/decoding, and a TCP exchange for
 empty-payload PING/PONG are implemented. Worker registration, its acknowledgment,
 and heartbeat formats are defined and tested, including their payload bytes.
-The worker and coordinator do not exchange these new messages yet.
+The coordinator accepts registrations, returns assigned IDs, and records valid
+heartbeats. The worker executable does not send these messages yet; integration
+tests use independent TCP peers to exercise the coordinator.
 
 ## Header layout
 
@@ -77,17 +79,20 @@ Worker                             Coordinator
 ```
 
 The worker must wait for the ACK before sending heartbeats, then use the
-assigned ID on that connection. The coordinator will need to assign distinct,
-nonzero IDs, associate each with its registered connection, and check heartbeat
+assigned ID on that connection. The coordinator assigns distinct,
+nonzero IDs, associates each with its registered connection, and checks heartbeat
 IDs against that association. Reconnection requires registration again; this
 format makes no promise of preserving IDs across connections or coordinator
-restarts. `HEARTBEAT` has no reply and carries no sender timestamp. Liveness will
-use the coordinator's own monotonic receive time, avoiding cross-machine clock
-comparisons. Scheduling, heartbeat intervals, and timeout detection come later.
+restarts. `HEARTBEAT` has no reply and carries no sender timestamp. The registry
+uses the coordinator's own monotonic receive time, avoiding cross-machine clock
+comparisons. Registration supplies the initial liveness timestamp; only complete,
+valid heartbeats update it afterward. Scheduling, periodic heartbeat sending,
+and missed-heartbeat detection come later.
 
-These connection-state rules are a contract for the upcoming worker lifecycle
-implementation. The codec validates byte structure and ID range; it cannot
-prove that an ID was issued, check connection ownership, or measure liveness.
+The coordinator and its [worker registry](workers.md) enforce connection ownership
+and reject duplicate registration on an already registered connection. The codec
+itself only validates byte structure and ID range. Disconnects mark a registered
+worker dead and clear its descriptor. A heartbeat cannot revive an old registration.
 
 The header functions only check that a type is recognized and a length is
 bounded. The complete-message functions additionally enforce the exact lengths
@@ -95,12 +100,14 @@ in the table. For example, a header declaring a 3-byte ACK is rejected at the
 message layer immediately; an ACK declaring 4 bytes with only 3 received is
 incomplete and needs more input.
 
-The existing TCP handlers still only accept PING at the coordinator and PONG at
-the CLI, with empty payloads. Other types, nonzero payload declarations, and
-malformed headers terminate that connection without a protocol error response.
-Connections can carry multiple empty PING/PONG exchanges in order; the CLI
-currently performs one exchange per invocation. Nonzero PING/PONG lengths in
-header tests exercise generic length encoding, not valid complete messages.
+The coordinator accepts empty PING and WORKER_REGISTER messages, and HEARTBEAT
+with the sending connection's assigned ID. PING is also allowed on registered
+connections for diagnostics, but does not update heartbeat time. PONG and
+WORKER_REGISTER_ACK are replies and are rejected as incoming requests. Wrong
+lengths, malformed frames, duplicate registration, and invalid heartbeat ownership
+close the offending connection without a protocol error response. The CLI still
+expects one empty PONG per invocation. Nonzero PING/PONG lengths in header tests
+exercise generic length encoding, not valid complete messages.
 
 ## Byte order and examples
 
@@ -203,7 +210,7 @@ need their own representation and validation.
 ## Validation and buffer ownership
 
 All four functions require non-null pointers to valid, non-overlapping storage.
-The caller owns all buffers; neither function allocates memory or performs I/O.
+The caller owns all buffers; none of the functions allocate memory or perform I/O.
 The encoder's size is writable capacity; the decoder's size is the number of
 input bytes actually available.
 
@@ -259,10 +266,11 @@ The general receiving flow is:
 A short header is incomplete input, not necessarily a malformed message. The
 current coordinator keeps partial headers per connection, and the CLI uses
 `faultline_recv_exact()` to collect a response. Both detect EOF during a header.
-The coordinator reads only the bytes remaining in one 12-byte header, leaving
-any following frames in the socket's receive buffer until it is ready for them.
-It rejects nonzero payload lengths immediately because the current handlers
-require empty payloads.
+The coordinator first reads only the bytes remaining in one 12-byte header.
+If a valid message needs a payload, it then collects that payload in the same
+16-byte buffer before dispatching. Following frames stay in the socket's receive
+buffer until the coordinator is ready for them. Incorrect lengths are rejected
+as soon as the header is complete.
 
 The header encoding/decoding functions remain independent of transport: they
 do not keep partial-read state, retry sends, or close connections. See
@@ -273,8 +281,8 @@ are buffered, its header is complete but two ID bytes are missing. It returns
 `BUFFER_TOO_SMALL`; the caller keeps those 14 bytes, appends the remaining two,
 and tries again. If two ACK frames are buffered together, a successful decode
 reports `consumed == 16`, leaving the next 16 bytes for a second call.
-Tests exercise this buffer behavior; wiring it into the live worker and
-coordinator is the next step.
+The coordinator now uses this decoder for incoming frames. Tests exercise both
+its buffer behavior and the live registration/heartbeat receive path.
 
 ## Verification
 

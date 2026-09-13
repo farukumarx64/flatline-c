@@ -7,10 +7,11 @@ and demonstrated with reproducible experiments.
 
 This note describes the intended MVP. The current implementation supports a
 tested TCP PING/PONG exchange between the CLI and a coordinator using `poll()`.
-Worker registration and heartbeat wire formats, including worker ID payloads,
-have tested encoders and decoders. The worker is still a scaffold; the live
-registration exchange, scheduling, heartbeat detection, and recovery have not
-been implemented yet.
+The coordinator also registers workers, returns assigned IDs, validates heartbeat
+ownership, and records connection state and heartbeat times in a worker registry.
+Disconnected workers are marked dead. The worker executable is still a scaffold;
+periodic heartbeat sending, missed-heartbeat detection, scheduling, and recovery
+have not been implemented yet.
 
 ## Components and ownership
 
@@ -84,10 +85,12 @@ Use C11, POSIX TCP sockets, and `poll()` for portable event multiplexing on macO
 and Linux, with pthreads where necessary. TCP messages require an explicit wire
 format and buffering for partial reads and writes; raw C structs must not be sent
 as the protocol. The implemented 12-byte header and its encoding are documented
-in [the protocol specification](protocol.md). The first empty-payload PING/PONG
-handlers and partial-transfer logic are implemented; see
-[the networking walkthrough](networking.md). Variable-length job payloads will
-require additional stream-parser states.
+in [the protocol specification](protocol.md). PING/PONG, registration, and
+heartbeat handlers support partial headers and the fixed worker ID payload; see
+[the networking walkthrough](networking.md). The coordinator's
+[worker registry](workers.md) owns IDs independently of reusable socket descriptors.
+Variable-length job payloads will require extending the current bounded buffers
+and message representation.
 
 Before job execution and persistence are implemented, resolve how workers keep
 sending heartbeats during long computations, how assignment attempts are
