@@ -46,6 +46,7 @@ test-unit: $(TEST_PROGRAMS)
 
 test-integration: all
 	$(PYTHON) tests/integration/test_ping.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
+	$(PYTHON) tests/integration/test_worker.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
 
 test-sanitize:
 	$(MAKE) SANITIZE=1 test

@@ -41,7 +41,7 @@ def heartbeat(worker_id):
     return HEARTBEAT_HEADER + struct.pack("!I", worker_id)
 
 
-class CoordinatorTests(unittest.TestCase):
+class CoordinatorTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cli = str((BIN_DIR / "faultline").resolve())
@@ -195,6 +195,7 @@ class CoordinatorTests(unittest.TestCase):
                 raise errors[0]
             return result
 
+class CoordinatorTests(CoordinatorTestCase):
     def test_cli_exchange_and_sequential_clients(self):
         for _ in range(3):
             self.assert_pong(self.run_cli())

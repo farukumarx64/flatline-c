@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,6 +34,41 @@ int faultline_parse_port(const char *text, uint16_t *port)
         return -1;
     }
     *port = (uint16_t)value;
+    return 0;
+}
+
+int faultline_parse_endpoint(const char *text, char *host, size_t host_size,
+                             uint16_t *port)
+{
+    const char *separator;
+    char parsed_host[INET_ADDRSTRLEN];
+    struct in_addr address;
+    uint16_t parsed_port;
+    size_t length;
+
+    if (text == NULL || host == NULL || port == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    separator = strchr(text, ':');
+    if (separator == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    length = (size_t)(separator - text);
+    if (length == 0 || length >= sizeof(parsed_host) || length >= host_size ||
+        faultline_parse_port(separator + 1, &parsed_port) < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(parsed_host, text, length);
+    parsed_host[length] = '\0';
+    if (inet_pton(AF_INET, parsed_host, &address) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(host, parsed_host, length + 1);
+    *port = parsed_port;
     return 0;
 }
 

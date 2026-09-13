@@ -1,5 +1,6 @@
 #include "net.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -220,6 +221,44 @@ static int test_disconnected_send(void)
     return EXIT_SUCCESS;
 }
 
+static int test_endpoint_parsing(void)
+{
+    const char *invalid[] = {
+        "", "127.0.0.1", ":9000", "127.0.0.1:", "127.0.0.1:0",
+        "127.0.0.1:65536", "127.0.0.1:-1", "127.0.0.1:12x",
+        "127.0.0.1:9000:1", "localhost:9000", "256.0.0.1:9000",
+        "127.0.0.1 :9000", "[::1]:9000", "1111.2222.3333.4444:9000"
+    };
+    char host[INET_ADDRSTRLEN];
+    char original[INET_ADDRSTRLEN];
+    uint16_t port = 7;
+
+    CHECK(faultline_parse_endpoint("127.0.0.1:9000", host, sizeof(host), &port) == 0);
+    CHECK(strcmp(host, "127.0.0.1") == 0 && port == 9000);
+    CHECK(faultline_parse_endpoint("255.255.255.255:65535", host, sizeof(host), &port) == 0);
+    CHECK(strcmp(host, "255.255.255.255") == 0 && port == UINT16_MAX);
+    CHECK(faultline_parse_endpoint("0.0.0.0:1", host, sizeof(host), &port) == 0);
+    CHECK(strcmp(host, "0.0.0.0") == 0 && port == 1);
+
+    memset(original, 0xa5, sizeof(original));
+    memcpy(host, original, sizeof(host));
+    port = 7;
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        CHECK(faultline_parse_endpoint(invalid[i], host, sizeof(host), &port) == -1);
+        CHECK(errno == EINVAL);
+        CHECK(memcmp(host, original, sizeof(host)) == 0 && port == 7);
+    }
+    for (size_t size = 0; size <= strlen("127.0.0.1"); ++size) {
+        CHECK(faultline_parse_endpoint("127.0.0.1:9000", host, size, &port) == -1);
+        CHECK(memcmp(host, original, sizeof(host)) == 0 && port == 7);
+    }
+    CHECK(faultline_parse_endpoint(NULL, host, sizeof(host), &port) == -1);
+    CHECK(faultline_parse_endpoint("127.0.0.1:9000", NULL, sizeof(host), &port) == -1);
+    CHECK(faultline_parse_endpoint("127.0.0.1:9000", host, sizeof(host), NULL) == -1);
+    CHECK(memcmp(host, original, sizeof(host)) == 0 && port == 7);
+    return EXIT_SUCCESS;
+}
+
 int main(void)
 {
     const struct {
@@ -231,7 +270,8 @@ int main(void)
         {"total receive deadline", test_receive_deadline},
         {"send all with backpressure", test_send_all_with_backpressure},
         {"send deadline", test_send_deadline},
-        {"disconnected send without SIGPIPE termination", test_disconnected_send}
+        {"disconnected send without SIGPIPE termination", test_disconnected_send},
+        {"numeric IPv4 endpoint parsing", test_endpoint_parsing}
     };
 
     CHECK(faultline_ignore_sigpipe() == 0);

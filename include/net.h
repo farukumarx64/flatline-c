@@ -17,6 +17,9 @@ enum faultline_receive_result {
 
 /* Helpers return -1 on error and set errno. Ports must be decimal 1..65535. */
 int faultline_parse_port(const char *text, uint16_t *port);
+/* Parse numeric IPv4:PORT into non-overlapping outputs; errors leave both unchanged. */
+int faultline_parse_endpoint(const char *text, char *host, size_t host_size,
+                             uint16_t *port);
 int faultline_set_nonblocking(int fd);
 int faultline_ignore_sigpipe(void);
 int64_t faultline_monotonic_ms(void);
