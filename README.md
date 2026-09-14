@@ -11,9 +11,10 @@ unit tests, socket tests, and process integration tests cover the exchange.
 The coordinator also accepts worker registration, assigns IDs, and tracks each
 worker's connection, liveness state, and last heartbeat time in a bounded registry.
 It checks incoming heartbeat IDs against their connections and marks workers
-dead on disconnect. The worker executable now connects, registers, prints its
-assigned ID, and keeps its connection open. Periodic heartbeat sending,
-missed-heartbeat detection, job execution, and persistence are future work.
+dead on disconnect or heartbeat expiry. The worker executable connects, registers,
+prints its assigned ID, and sends a heartbeat every two seconds. The coordinator
+expires a worker after six seconds without a valid heartbeat. Both durations are
+configurable. Job execution and persistence are future work.
 
 ## Build and run
 
@@ -54,14 +55,29 @@ Each prints its assigned ID and stays running. On a fresh coordinator, the first
 two registrations get IDs 1 and 2 (process scheduling determines which gets 1):
 
 ```text
-[INFO] worker registered worker_id=1 coordinator=127.0.0.1:9000
-[INFO] worker registered worker_id=2 coordinator=127.0.0.1:9000
+[INFO] worker registered worker_id=1 coordinator=127.0.0.1:9000 heartbeat_interval_ms=2000
+[INFO] worker registered worker_id=2 coordinator=127.0.0.1:9000 heartbeat_interval_ms=2000
 ```
 
 Use `./build/debug/faultline-worker --coordinator 127.0.0.1:9000` to specify an
 endpoint. Ctrl+C or SIGTERM stops the worker and closes its socket. Unexpected
 coordinator disconnection makes the worker report an error and exit; automatic
 reconnection is not implemented yet.
+
+To change the heartbeat timings, start the programs with these options:
+
+```sh
+# Coordinator terminal: expire after 3 seconds without a valid heartbeat
+./build/debug/faultline-coordinator --port 9000 --heartbeat-timeout-ms 3000
+
+# Worker terminal: send every 1 second
+./build/debug/faultline-worker --coordinator 127.0.0.1:9000 --heartbeat-interval-ms 1000
+```
+
+Durations are positive decimal milliseconds. Configure the timeout comfortably
+above every worker's interval; the separate processes do not negotiate these
+values. The [worker guide](docs/workers.md) explains timing, timeout logs, and a
+pause/resume experiment that demonstrates failure detection with an open socket.
 
 The coordinator currently binds only to IPv4 loopback. The CLI and worker accept numeric
 IPv4 addresses and ports from 1 through 65535. Hostname resolution, IPv6, and a
@@ -97,7 +113,7 @@ the real executables. `test-sanitize` instruments all C programs under test.
 Use `make test-unit` or `make test-integration` to run either layer separately.
 
 Integration tests normally choose an available loopback port, leaving the
-default-endpoint check skipped. To also exercise both programs' port 9000
+default-endpoint checks skipped. To also exercise all three programs' port 9000
 defaults, first stop any existing coordinator and run:
 
 ```sh
@@ -120,7 +136,7 @@ faultline/
 ├── src/
 │   ├── common/          Shared protocol, networking, and logging code
 │   ├── coordinator/     Event loop and worker registry
-│   ├── worker/          Worker connection and registration
+│   ├── worker/          Worker registration and periodic heartbeats
 │   └── cli/             Client entry point and future implementation
 └── tests/               Protocol/registry/socket unit tests and TCP integration tests
 ```
@@ -131,5 +147,5 @@ MVP guarantees, and design decisions still to be resolved. Read
 order, validation rules, and the C API. The [networking walkthrough](docs/networking.md)
 explains the PING/PONG exchange, connection state, partial I/O, and deadlines.
 The [worker guide](docs/workers.md) describes the registration exchange, worker
-IDs, connection ownership, and heartbeat timestamps. The next step is periodic
-heartbeat sending and configurable missed-heartbeat detection.
+IDs, connection ownership, and heartbeat timing. The next phase introduces job
+messages, queued work, and assignment to available workers.

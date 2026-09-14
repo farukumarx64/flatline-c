@@ -47,7 +47,7 @@ test, source line, and expression. Its checks remain active with `NDEBUG` set.
   checking byte-consumption counts and decoding again as the remaining ID bytes
   arrive. This is a buffer-level test, not a live worker registration exchange.
 
-`test_net.c` has six socket test groups and one endpoint-parsing group. Socket
+`test_net.c` has six socket test groups and two parsing groups. Socket
 tests use local stream socket pairs and child processes to verify fragmented
 receives, clean EOF versus truncation,
 one total receive deadline despite progress, a 256 KiB send through a constrained
@@ -60,9 +60,15 @@ unsupported hostname/IPv6 inputs, null arguments, and insufficient host buffers.
 Failed parsing leaves the host and port outputs unchanged. Both the CLI and
 worker use this shared parser.
 
-`test_worker_registry.c` has six groups covering registration and lookup,
+Duration tests check positive decimal milliseconds, leading zeros, `INT_MAX`,
+overflow, malformed input, null pointers, and unchanged output on failure.
+
+`test_worker_registry.c` has seven groups covering registration and lookup,
 heartbeat ownership and monotonic time, disconnect and descriptor reuse,
-capacity/duplicate registration/churn, ID exhaustion, and invalid arguments.
+capacity/duplicate registration/churn, ID exhaustion, invalid arguments, and
+heartbeat expiration. Expiry checks cover just before, exactly at, and after a
+deadline, heartbeat renewal, dead/unused records, invalid inputs, a one-millisecond
+timeout, and timestamps near `INT64_MAX` without overflowing an added deadline.
 These tests supply descriptor numbers and timestamps directly; no real sockets
 or sleeps are needed. Reusing descriptor 7 is deliberate and deterministic.
 Stale IDs cannot update or kill its replacement worker. Churn exceeds the
@@ -83,8 +89,8 @@ all 15 two-part heartbeat splits, registration plus a coalesced PING and half-cl
 70 successive registrations/disconnects, heartbeat ownership and stale IDs,
 duplicate registration, truncated/invalid worker frames, and an idle registered
 worker alongside a stalled payload. The stalled payload times out and marks its
-worker dead; the idle worker stays connected pending the future heartbeat timeout
-policy. Logs verify state transitions and timestamp updates, including that PING
+worker dead; the idle worker expires under the default six-second heartbeat timeout.
+Logs verify state transitions and timestamp updates, including that PING
 and incomplete heartbeat bytes do not count as heartbeats. Positional log reads
 avoid moving the file offset shared with the coordinator's output stream.
 
@@ -116,14 +122,39 @@ second header in two more pieces before checking a third exchange.
 - Help, invalid arguments, and an unavailable endpoint (which may consume the
   existing five-second connect budget instead of refusing immediately).
 
-The worker suite also verifies decoding/printing `UINT32_MAX`. Both integration
+The worker suite also verifies decoding/printing `UINT32_MAX`. Integration
 suites share coordinator setup, cleanup, and protocol helpers through the
-`CoordinatorTestCase` base class; the original coordinator tests run only once.
+`CoordinatorTestCase` base class; worker process helpers live in
+`WorkerProcessTestCase`. Test methods remain in their own subclasses and run only once.
 Worker subprocesses are always cleaned up, and their stderr is checked for
 AddressSanitizer/UBSan reports.
 
-By default, each integration suite selects an available port and skips its
-specific default-endpoint check. To run all 32 scenarios, stop any existing
+`integration/test_heartbeat.py` adds eight timing and failure scenarios:
+
+- Default two-second heartbeat cadence keeps a real worker alive past six
+  seconds while an open, silent registration expires after the default timeout.
+- A controlled peer independently checks repeated exact 16-byte heartbeat frames
+  at a 120 ms interval; a partial ACK must not start heartbeat sending.
+- Two workers with different intervals survive multiple 750 ms timeout windows.
+  Pausing one with SIGSTOP leaves its socket open, then expires only that worker.
+  The other worker and CLI continue; resuming the expired worker fails and a
+  replacement gets a fresh ID.
+- A valid heartbeat renews the deadline beyond the original registration deadline.
+- PING traffic and trickled heartbeat header/payload bytes cannot renew liveness.
+- A worker configured to send more slowly than the timeout expires before its
+  first heartbeat.
+- A heartbeat queued while the coordinator is paused is rejected after expiry
+  when the coordinator resumes; it cannot revive the old registration.
+- Invalid/missing/duplicate duration arguments, overflow, help output, and worker
+  options in reverse order.
+
+Timing assertions allow scheduling slack; exact deadline boundaries are covered
+by deterministic C tests. Every paused process is resumed in a `finally` block
+before normal cleanup. The heartbeat suite uses both default timings and a
+shorter coordinator timeout for focused scenarios; each fixture owns its processes.
+
+By default, suites select available ports. The original coordinator and worker
+suites each skip one default-endpoint check. To run all 40 scenarios, stop any existing
 coordinator on port 9000 and run:
 
 ```sh
@@ -136,5 +167,5 @@ When 9000 is selected, the harness starts the coordinator without `--port` and
 also invokes `faultline ping` and `faultline-worker` without `--coordinator`
 to test all defaults. Processes started by the harness are stopped afterward.
 The coordinator, CLI, and worker
-are not yet tested for job execution, missed-heartbeat detection, or persistent recovery;
+are not yet tested for job execution or persistent recovery;
 those features will add their own integration scenarios.

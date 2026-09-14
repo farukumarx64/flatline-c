@@ -7,8 +7,9 @@ empty-payload PING/PONG are implemented. Worker registration, its acknowledgment
 and heartbeat formats are defined and tested, including their payload bytes.
 The coordinator accepts registrations, returns assigned IDs, and records valid
 heartbeats. The worker executable sends WORKER_REGISTER, validates the ACK header
-and ID payload, and retains its assigned ID while connected. Periodic HEARTBEAT
-sending is still to come. Integration tests also use independent TCP peers.
+and ID payload, and uses its assigned ID in periodic HEARTBEAT messages. Timing
+configuration and expiration policy are described in [workers.md](workers.md);
+they add no fields to the wire format. Integration tests also use independent TCP peers.
 
 ## Header layout
 
@@ -87,12 +88,13 @@ format makes no promise of preserving IDs across connections or coordinator
 restarts. `HEARTBEAT` has no reply and carries no sender timestamp. The registry
 uses the coordinator's own monotonic receive time, avoiding cross-machine clock
 comparisons. Registration supplies the initial liveness timestamp; only complete,
-valid heartbeats update it afterward. Scheduling, periodic heartbeat sending,
-and missed-heartbeat detection come later.
+valid heartbeats update it afterward. Workers send every two seconds and the
+coordinator expires a registration after six seconds without a valid heartbeat
+by default. Both durations are configurable locally; scheduling comes later.
 
 The coordinator and its [worker registry](workers.md) enforce connection ownership
 and reject duplicate registration on an already registered connection. The codec
-itself only validates byte structure and ID range. Disconnects mark a registered
+itself only validates byte structure and ID range. Disconnects and timeouts mark a registered
 worker dead and clear its descriptor. A heartbeat cannot revive an old registration.
 
 The header functions only check that a type is recognized and a length is

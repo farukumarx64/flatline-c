@@ -6,10 +6,11 @@ Its registry is in `src/coordinator/worker_registry.c`, with the public interfac
 in `include/worker_registry.h`. The wire format is documented in
 [protocol.md](protocol.md); the event loop is described in [networking.md](networking.md).
 
-The worker executable now connects and registers, reads its assigned ID from
-the acknowledgment, and stays connected. Periodic heartbeat sending,
-missed-heartbeat detection, scheduling, and persistent recovery are not
-implemented yet. Integration tests cover both real workers and controlled peers.
+The worker executable connects and registers, reads its assigned ID from
+the acknowledgment, and sends periodic heartbeats. The coordinator expires
+registrations that miss their heartbeat deadline. Scheduling and persistent
+recovery are not implemented yet. Integration tests cover both real workers
+and controlled peers.
 
 ## Run two workers
 
@@ -29,8 +30,8 @@ Build with `make`, then start the coordinator and two workers in separate termin
 The first two registrations on a fresh coordinator receive distinct IDs:
 
 ```text
-[INFO] worker registered worker_id=1 coordinator=127.0.0.1:9000
-[INFO] worker registered worker_id=2 coordinator=127.0.0.1:9000
+[INFO] worker registered worker_id=1 coordinator=127.0.0.1:9000 heartbeat_interval_ms=2000
+[INFO] worker registered worker_id=2 coordinator=127.0.0.1:9000 heartbeat_interval_ms=2000
 ```
 
 The IDs are assigned by registration order, not by terminal or process number.
@@ -53,7 +54,7 @@ with port numbers 1 through 65535.
 3. Encode and send the 12-byte WORKER_REGISTER frame.
 4. Collect and validate the 12-byte ACK header, then its four ID bytes.
 5. Decode the complete ACK and retain the assigned ID.
-6. Print registration success and wait with the connection open.
+6. Print registration success and start the periodic heartbeat loop.
 7. Close the socket on a local stop, disconnection, or error.
 
 The worker accepts only WORKER_REGISTER_ACK with a four-byte payload and nonzero
@@ -63,11 +64,115 @@ for the complete ACK. Invalid headers fail immediately; EOF during the header
 or payload is a failed registration. Connect and send each have their own
 five-second budget.
 
-SIGINT/SIGTERM interrupt the ACK or idle wait promptly; connect/send may finish
+SIGINT/SIGTERM interrupt the ACK or heartbeat wait promptly; connect/send may finish
 their bounded operation first. A local stop exits successfully. Coordinator
 disconnection, invalid ACKs, or unexpected data after registration exit with
-failure. The worker does not yet send periodic heartbeats, process jobs, or
-automatically reconnect. Its retained ID applies only to this connection.
+failure. The worker does not yet process jobs or automatically reconnect.
+Its retained ID applies only to this connection.
+
+## Heartbeat interval and timeout
+
+| Setting | Program | Default | Option |
+| --- | --- | --- | --- |
+| Time between heartbeat sends | Worker | 2000 ms (2 seconds) | `--heartbeat-interval-ms MS` |
+| Maximum time without a valid heartbeat | Coordinator | 6000 ms (6 seconds) | `--heartbeat-timeout-ms MS` |
+
+These are runtime arguments; recompilation is unnecessary. They accept decimal
+integers from 1 through `INT_MAX` (2147483647 on the target macOS/Linux builds).
+Zero, negatives, signs, fractions, whitespace, overflow, missing values, and
+duplicate options are rejected. Address/port and timing options may appear in
+either order. `faultline_parse_duration_ms()` checks before multiplying to avoid
+integer overflow and leaves the output unchanged on failure.
+
+For example, use a one-second interval and a three-second timeout:
+
+```sh
+# Coordinator terminal
+./build/debug/faultline-coordinator --port 9000 --heartbeat-timeout-ms 3000
+
+# Each worker terminal
+./build/debug/faultline-worker --coordinator 127.0.0.1:9000 --heartbeat-interval-ms 1000
+```
+
+Each process owns its setting. Values are not negotiated in registration or sent
+on the wire. Choose a timeout comfortably longer than every worker's interval,
+allowing for network and scheduling delays. A worker whose interval exceeds the
+coordinator's timeout can expire before its first heartbeat. Very small positive
+values are accepted for experiments; they do not promise real-time scheduling.
+
+After validating the complete registration ACK, `run_heartbeats()` encodes one
+16-byte frame: the existing 12-byte HEARTBEAT header and its four-byte assigned ID,
+all in big-endian order. The frame is reused because the ID does not change on
+this connection. No timestamp or heartbeat acknowledgment is added to the protocol.
+
+The first send is due one interval after ACK processing. `wait_for_input()` uses
+`poll()` to wait for connection activity, a stop signal, or that deadline. A due
+heartbeat is a normal timer event; a deadline reached while waiting for an ACK
+remains a registration error. The poll wait is capped at 250 ms for prompt signal
+handling; the worker sleeps in the kernel between events instead of spinning.
+
+`faultline_send_all()` sends the entire frame despite partial writes. Failure
+ends the worker connection. After local send completion, the next deadline is
+the current monotonic time plus the interval. This avoids catch-up bursts after
+a pause or delayed send. Connect, registration send, and each heartbeat send
+retain the existing five-second operation budget; these bounded helpers may
+finish before a pending local stop is honored. No new thread is created.
+
+The coordinator uses the following rule for every ALIVE worker:
+
+```text
+elapsed = now_ms - last_heartbeat_ms
+expire when elapsed >= heartbeat_timeout_ms
+```
+
+Registration supplies the first baseline, so a worker that never sends a
+heartbeat still expires. A valid heartbeat renews it. The coordinator shortens
+its `poll()` wait to the nearest heartbeat deadline, reads the clock again after
+waking, and checks expiry before handling socket events. Thus an expired worker
+cannot recover its old identity by sending a late heartbeat, even if those bytes
+are already buffered in the socket. OS scheduling delays can postpone detection.
+
+For example, with the defaults:
+
+```text
+time 0s: registration establishes the initial baseline
+time 2s: heartbeat received; deadline becomes 8s
+time 4s: heartbeat received; deadline becomes 10s
+time 6s: no heartbeat; worker remains ALIVE
+time 8s: no heartbeat; worker remains ALIVE
+time 10s: six seconds since the last heartbeat; worker becomes DEAD
+```
+
+Timeout closes that connection through the existing cleanup path: mark DEAD,
+detach the descriptor, and close the socket. Other workers and the CLI continue
+to run. A new connection must register and receives a fresh ID. There is no job
+requeue action yet because jobs and assignments have not been implemented.
+
+A timeout means the coordinator considers this registration unavailable. It does
+not prove the process crashed: a pause, network delay, or overloaded machine can
+produce the same observation. This distinction will matter when retrying jobs.
+
+## Observe a worker timeout
+
+With a coordinator already running, use a worker terminal:
+
+```sh
+./build/debug/faultline-worker &
+worker_pid=$!
+sleep 5
+kill -STOP "$worker_pid"
+sleep 7
+kill -CONT "$worker_pid"
+wait "$worker_pid"
+```
+
+`SIGSTOP` pauses the worker without closing its TCP socket. After six seconds
+since its latest valid heartbeat, the coordinator logs `heartbeat_timeout` and
+`worker_dead ... reason=heartbeat_timeout`. `SIGCONT` resumes the worker so it can
+observe the closed connection and exit with failure; `wait` therefore returns a
+nonzero status. A second worker should continue sending heartbeats throughout.
+By contrast, stopping a worker with Ctrl+C closes its socket, allowing immediate
+disconnect handling without waiting for the heartbeat timeout.
 
 ## Identity and storage
 
@@ -122,22 +227,23 @@ to close; an offending worker cannot update another worker's heartbeat time.
 
 ALIVE means registered and not yet marked unavailable, rather than proof that
 the remote process is healthy. DEAD means the registration's connection has
-closed or been rejected. All registered-client close paths mark the entry dead
+closed, been rejected, or exceeded its heartbeat timeout. All registered-client close paths mark the entry dead
 and clear its descriptor before the OS can reuse it. The last timestamp remains
 available until the slot is replaced.
 
 Times use `CLOCK_MONOTONIC` milliseconds, not wall-clock dates or worker-supplied
-timestamps. Registration initializes the timestamp to give a future heartbeat
-timeout a baseline before the first heartbeat arrives. Later, only complete,
+timestamps. Registration initializes the heartbeat timeout's baseline before
+the first heartbeat arrives. Later, only complete,
 validated heartbeats advance it. PINGs, replies, and partial messages only update
 the separate I/O progress timestamp. The registry rejects a heartbeat timestamp
 older than the one already stored; equal timestamps are allowed.
 
-No heartbeat expiration scan runs yet. Registered workers waiting between
-messages stay connected even if silent. The five-second transport inactivity
+The heartbeat timeout applies to all registered workers, including those with
+partial input or pending replies. The separate five-second transport inactivity
 limit still protects unregistered clients, partial incoming frames, and pending
-replies. The next heartbeat phase must add its own configurable timeout using
-the registry timestamp.
+replies. Successful byte transfers can renew that transport timer while the
+heartbeat deadline continues approaching. Neither PINGs nor a trickle of an
+incomplete heartbeat can keep a registration alive indefinitely.
 
 ## API
 
@@ -146,6 +252,7 @@ the registry timestamp.
 | `faultline_worker_registry_init()` | Initialize an empty registry and ID counter once. |
 | `faultline_worker_register()` | Add an ALIVE record and return a fresh ID. |
 | `faultline_worker_find()` | Find an ALIVE or retained DEAD record by ID. |
+| `faultline_worker_timed_out()` | Read-only check for an ALIVE record whose heartbeat deadline has elapsed. |
 | `faultline_worker_heartbeat()` | Verify the ID/connection pair and update heartbeat time. |
 | `faultline_worker_mark_dead()` | Verify the ID/connection pair, mark DEAD, and detach the descriptor. |
 
@@ -166,7 +273,7 @@ make
 
 For protocol inspection, this optional Python peer registers, prints its assigned
 ID, sends one heartbeat, and disconnects. It uses only the Python standard library;
-the real worker executable currently registers and waits without sending heartbeats.
+the real worker executable handles periodic sending automatically.
 
 ```sh
 python3 - <<'PY'
@@ -196,11 +303,15 @@ PY
 ```
 
 The coordinator logs `worker_registered`, `worker_register_ack_sent`,
-`heartbeat_received`, and `worker_dead`. Registration/death events include state;
+`heartbeat_received`, `heartbeat_timeout`, and `worker_dead`. Registration/death events include state;
 registration/heartbeat/death events include the last heartbeat timestamp. Each
 event carries both `worker_id` and `fd` to distinguish identity from connection.
 The descriptor on a death log identifies the socket being closed; the registry
 record's descriptor has already been cleared to -1.
+
+Startup logs show the effective timeout/interval. Workers log `heartbeat_sent`
+with their ID after a complete local send. This alone does not prove coordinator
+receipt; the coordinator's `heartbeat_received` event confirms processing.
 
 Run `make test` and `make test-sanitize` for registry unit tests, real coordinator
 worker-message tests, and the existing protocol and TCP regression tests.

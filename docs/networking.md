@@ -3,8 +3,8 @@
 Faultline can now start a coordinator on `127.0.0.1:9000`, accept a CLI connection,
 receive a binary PING header, and send a binary PONG header. The coordinator also
 accepts registration and heartbeat frames and owns a [worker registry](workers.md).
-The worker executable connects and registers through the same protocol. Periodic
-worker heartbeats and job scheduling are still to come.
+The worker executable connects, registers, and sends periodic heartbeats through
+the same protocol. The coordinator expires silent workers. Job scheduling is still to come.
 
 ## Run it
 
@@ -37,7 +37,7 @@ shutdown, closes all client sockets and the listener, and exits the event loop.
 | `src/coordinator/main.c` | Listener, client slots, poll loop, frame handling, queued replies, and registry integration. |
 | `include/worker_registry.h`, `src/coordinator/worker_registry.c` | Coordinator-owned IDs, connections, liveness states, and heartbeat timestamps. |
 | `src/cli/main.c` | CLI arguments, one connection, request transmission, and response validation. |
-| `src/worker/main.c` | Worker arguments, registration request/ACK, retained connection, and shutdown. |
+| `src/worker/main.c` | Worker arguments, registration request/ACK, heartbeat timer, and shutdown. |
 
 `protocol.h` and `protocol.c` own the 12-byte header and complete-message formats.
 Networking uses their encoders and decoders; it does not send raw C structs.
@@ -82,8 +82,13 @@ ordinary code performs cleanup. This loop has one five-second deadline covering
 both header and payload, even if bytes continue arriving slowly.
 
 After registration, the worker retains the socket and ID and waits for a stop
-request or coordinator activity. There is no idle timeout at this stage. It
-does not send heartbeats yet. EOF, reset, or unexpected incoming bytes produce
+request, coordinator activity, or the next heartbeat deadline. It encodes a
+16-byte HEARTBEAT once and sends that frame at the configured interval, using
+`faultline_send_all()` to preserve partial-write handling. The first deadline is
+one interval after the complete ACK. Later deadlines start at local send completion,
+so a delayed worker sends no catch-up burst. A `heartbeat_sent` log records local
+send completion; only the coordinator's `heartbeat_received` log proves processing.
+EOF, reset, a send failure, or unexpected incoming bytes produce
 an error and a failure exit; future job handling will replace that last case.
 The worker reads exactly the ACK size so additional bytes cannot be silently
 swallowed by the registration receive loop. Local SIGINT/SIGTERM requests close
@@ -155,7 +160,7 @@ A `POLLHUP` event may accompany buffered input. The coordinator still attempts
 the relevant I/O, so a client that sends PING and then shuts down its write half
 can receive PONG. A reset or broken connection closes that client alone.
 
-Both executables ignore SIGPIPE so a send to a closed connection produces an
+All three executables ignore SIGPIPE so a send to a closed connection produces an
 error that code can handle, rather than terminating the process. This does not
 hide the send error. Socket setup failures close any newly created descriptor,
 and the CLI closes its connection on both success and failure.
@@ -169,7 +174,7 @@ budget for the entire invocation.
 
 The worker similarly allows five seconds to connect, five seconds to send the
 registration, and one five-second deadline for the whole ACK. Its ACK receive
-loop and idle wait are interruptible; the shared connect/send helpers may finish
+loop and heartbeat wait are interruptible; the shared connect/send helpers may finish
 their current bounded operation before honoring a local stop request.
 
 The coordinator applies a five-second inactivity limit to unregistered clients,
@@ -179,11 +184,19 @@ second when idle, so a stalled operation usually closes within five to six
 seconds. Successful byte transfers refresh this I/O timer.
 
 Registered workers waiting between complete messages are exempt from this I/O
-timer. Their separate registry timestamp changes only at registration or after
-a valid heartbeat. A future configurable heartbeat timeout will use that
-timestamp; it is not enforced yet. PINGs and partial messages cannot count as
-heartbeats. A connected worker that stops sending all data currently stays ALIVE
-until its connection closes; silence-based failure detection is still required.
+timer. They have a separate heartbeat deadline, initially measured from registration
+and subsequently from the latest complete, valid heartbeat. The default timeout
+is 6000 ms, configurable with `--heartbeat-timeout-ms`. PINGs and partial frames
+cannot renew it, even while successful transfers refresh the separate I/O timer.
+
+The coordinator caps each `poll()` wait at the nearest worker deadline as well
+as its usual one-second ceiling, allowing subsecond timeout settings. After
+waking, it reads the monotonic clock again and expires workers before processing
+socket events. A complete heartbeat must be processed before expiry; even buffered
+bytes cannot revive an expired ID. Scheduling delays can postpone the check, so
+this is not a hard real-time guarantee. An expired client follows the same cleanup
+path as a disconnect: mark DEAD, clear its descriptor, then close its socket.
+Its death log uses `reason=heartbeat_timeout`.
 
 All elapsed-time calculations use `CLOCK_MONOTONIC`, which avoids wall-clock
 adjustments affecting timeouts.
@@ -195,11 +208,11 @@ HEARTBEAT require exactly four ID bytes. Incorrect types, malformed frames,
 wrong lengths, and invalid registration/heartbeat state close the affected
 connection without an error frame. Every registered-client close path marks its
 worker DEAD and detaches the descriptor before calling `close()`, including
-EOF, I/O errors, protocol rejection, stalled transfers, and coordinator shutdown.
+EOF, I/O errors, protocol rejection, stalled transfers, heartbeat expiry, and coordinator shutdown.
 
 The coordinator currently listens only on IPv4 loopback. The CLI and worker accept a
 numeric IPv4 address. There is no hostname resolution, IPv6, automatic worker
-heartbeat sending, missed-heartbeat detection, job execution, or persistence yet.
+reconnection, job execution, or persistence yet.
 Logs provide basic event
 visibility; full timestamped structured logging remains future work.
 
