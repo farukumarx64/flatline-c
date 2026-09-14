@@ -12,7 +12,9 @@ ownership, and records connection state and heartbeat times in a worker registry
 Disconnected or timed-out workers are marked dead. The worker executable connects,
 registers, validates its assigned ID, and sends periodic heartbeats. Worker interval
 and coordinator timeout are configurable, defaulting to two and six seconds.
-Scheduling and recovery have not been implemented yet.
+The [job model](jobs.md) defines records and validated state transitions, including
+attempt identity and bounded requeue/failure rules. Queuing, job messages,
+scheduling, execution, automatic retries, and recovery have not been implemented yet.
 
 ## Components and ownership
 
@@ -94,8 +96,8 @@ Variable-length job payloads will require extending the current bounded buffers
 and message representation.
 
 Before job execution and persistence are implemented, resolve how workers keep
-sending heartbeats during long computations, how assignment attempts are
-identified, how retries are counted across restarts, and how WAL writes,
+sending heartbeats during long computations, how job/attempt IDs and retry
+counters are preserved across restarts, and how WAL writes,
 acknowledgments, and incomplete trailing records are handled.
 
 ## Evidence required for v0.1

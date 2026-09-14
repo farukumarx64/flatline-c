@@ -7,7 +7,7 @@ make test
 make test-sanitize
 ```
 
-These run protocol, registry, and socket unit tests written in C plus process integration
+These run protocol, registry, job, and socket unit tests written in C plus process integration
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
@@ -75,6 +75,28 @@ These tests supply descriptor numbers and timestamps directly; no real sockets
 or sleeps are needed. Reusing descriptor 7 is deliberate and deterministic.
 Stale IDs cannot update or kill its replacement worker. Churn exceeds the
 64-slot capacity without replacing live records; exhaustion never wraps to ID 1.
+
+`test_jobs.c` adds nine in-memory model test groups:
+
+- All four task identifiers, initial fields, argument ownership, zero-length
+  arguments, and exact maximum-length payloads.
+- A successful assignment/start/completion lifecycle, timestamp updates, and
+  result ownership including embedded zero bytes and maximum-sized results.
+- Every pair of the five states, plus unknown states, against an explicit graph.
+- Every named operation from every state with zero and nonzero retry allowance;
+  includes rejected self-transitions and terminal-state changes.
+- Requeue/reset semantics, retry followed by success, assignment back to the same
+  worker, and rejection of old STARTED, COMPLETED, and failure reports.
+- Zero retries, exhausted retries, and failure before the worker reports starting.
+- Null pointers, zero IDs, unknown tasks/failure reasons, negative time, oversized
+  arguments/results (including SIZE_MAX), and unchanged records on errors.
+- Wrong worker IDs, wrong attempt numbers, reversed timestamps, and equal-time events.
+- Maximum job/worker IDs and timestamps, and the final retry/assignment boundary
+  beyond UINT32_MAX attempts, without billions of iterations or counter wrap.
+
+These tests need no sockets or sleeps. They verify model-level transitions only;
+there is no job submission, queue, executor, or automatic retry in the running
+programs yet. The job model links only into the coordinator and its test binary.
 
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
 Its original 15 scenarios cover a successful exchange and sequential clients, default

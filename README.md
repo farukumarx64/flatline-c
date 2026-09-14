@@ -20,6 +20,12 @@ Dedicated failure tests distinguish worker exit and TCP reset from missed
 heartbeats on an open connection. A healthy worker and the CLI must remain usable
 in every case; timeout logs report the measured silence duration.
 
+An in-memory job model now defines task types, owned arguments/results, states,
+worker assignments, attempt numbers, timestamps, and bounded retry transitions.
+Its operations reject invalid transitions and stale reports. Jobs are not yet
+submitted or executed by the running programs; the FIFO queue and job message
+handlers come next.
+
 ## Build and run
 
 Requirements: Make and a C11 compiler such as Clang or GCC. The project targets
@@ -105,7 +111,7 @@ Sanitizer builds stop on detected undefined behavior. Normal and sanitizer
 outputs live in separate directories. Use `make clean` to remove both; also
 clean before changing compilers or flags within the same build configuration.
 
-## Test the protocol and TCP exchange
+## Tests
 
 ```sh
 make test
@@ -137,14 +143,15 @@ faultline/
 │   ├── architecture.md
 │   ├── protocol.md
 │   ├── networking.md
-│   └── workers.md
+│   ├── workers.md
+│   └── jobs.md
 ├── include/             Shared C headers
 ├── src/
 │   ├── common/          Shared protocol, networking, and logging code
-│   ├── coordinator/     Event loop and worker registry
+│   ├── coordinator/     Event loop, worker registry, and job model
 │   ├── worker/          Worker registration and periodic heartbeats
 │   └── cli/             Client entry point and future implementation
-└── tests/               Protocol/registry/socket unit tests and TCP integration tests
+└── tests/               Protocol/registry/job/socket unit tests and TCP integration tests
 ```
 
 Read [the architecture note](docs/architecture.md) for component responsibilities,
@@ -153,5 +160,7 @@ MVP guarantees, and design decisions still to be resolved. Read
 order, validation rules, and the C API. The [networking walkthrough](docs/networking.md)
 explains the PING/PONG exchange, connection state, partial I/O, and deadlines.
 The [worker guide](docs/workers.md) describes the registration exchange, worker
-IDs, connection ownership, and heartbeat timing. The next phase introduces job
-messages, queued work, and assignment to available workers.
+IDs, connection ownership, and heartbeat timing. The [job guide](docs/jobs.md)
+defines the record, state transitions, attempt identity, and retry limits.
+The next step is the coordinator's FIFO job queue, followed by job messages and
+assignment to available workers.
