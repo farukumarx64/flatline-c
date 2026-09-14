@@ -35,6 +35,15 @@ const struct faultline_worker *faultline_worker_find(
     return slot == FAULTLINE_MAX_WORKERS ? NULL : &registry->workers[slot];
 }
 
+int faultline_worker_timed_out(const struct faultline_worker *worker,
+                              int64_t now_ms, int timeout_ms)
+{
+    return worker != NULL && worker->state == FAULTLINE_WORKER_ALIVE &&
+           timeout_ms > 0 && worker->last_heartbeat_ms >= 0 &&
+           now_ms >= worker->last_heartbeat_ms &&
+           now_ms - worker->last_heartbeat_ms >= timeout_ms;
+}
+
 enum faultline_registry_result faultline_worker_register(
     struct faultline_worker_registry *registry, int fd, int64_t now_ms,
     uint32_t *worker_id)

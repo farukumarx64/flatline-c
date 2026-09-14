@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -259,6 +260,30 @@ static int test_endpoint_parsing(void)
     return EXIT_SUCCESS;
 }
 
+static int test_duration_parsing(void)
+{
+    const char *invalid[] = {
+        "", "0", "000", "-1", "+2", "1.5", " 2000", "2000 ", "2s",
+        "2147483648", "99999999999999999999999999999999999999"
+    };
+    int duration = 7;
+    char maximum[32];
+
+    CHECK(faultline_parse_duration_ms("1", &duration) == 0 && duration == 1);
+    CHECK(faultline_parse_duration_ms("002000", &duration) == 0 && duration == 2000);
+    (void)snprintf(maximum, sizeof(maximum), "%d", INT_MAX);
+    CHECK(faultline_parse_duration_ms(maximum, &duration) == 0 && duration == INT_MAX);
+    duration = 7;
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        CHECK(faultline_parse_duration_ms(invalid[i], &duration) == -1);
+        CHECK(errno == EINVAL && duration == 7);
+    }
+    CHECK(faultline_parse_duration_ms(NULL, &duration) == -1);
+    CHECK(errno == EINVAL && duration == 7);
+    CHECK(faultline_parse_duration_ms("2000", NULL) == -1 && errno == EINVAL);
+    return EXIT_SUCCESS;
+}
+
 int main(void)
 {
     const struct {
@@ -271,7 +296,8 @@ int main(void)
         {"send all with backpressure", test_send_all_with_backpressure},
         {"send deadline", test_send_deadline},
         {"disconnected send without SIGPIPE termination", test_disconnected_send},
-        {"numeric IPv4 endpoint parsing", test_endpoint_parsing}
+        {"numeric IPv4 endpoint parsing", test_endpoint_parsing},
+        {"positive millisecond duration parsing", test_duration_parsing}
     };
 
     CHECK(faultline_ignore_sigpipe() == 0);

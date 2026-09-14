@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <string.h>
@@ -34,6 +35,32 @@ int faultline_parse_port(const char *text, uint16_t *port)
         return -1;
     }
     *port = (uint16_t)value;
+    return 0;
+}
+
+int faultline_parse_duration_ms(const char *text, int *duration_ms)
+{
+    int value = 0;
+
+    if (text == NULL || duration_ms == NULL || *text == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    for (const char *cursor = text; *cursor != '\0'; ++cursor) {
+        int digit = *cursor - '0';
+
+        /* Check before multiplying, so even very long inputs cannot overflow. */
+        if (digit < 0 || digit > 9 || value > (INT_MAX - digit) / 10) {
+            errno = EINVAL;
+            return -1;
+        }
+        value = value * 10 + digit;
+    }
+    if (value == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    *duration_ms = value;
     return 0;
 }
 

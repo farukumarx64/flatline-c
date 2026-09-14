@@ -22,11 +22,16 @@ static void request_stop(int signal_number)
 
 static void usage(FILE *stream)
 {
-    fputs("Usage: faultline-worker [--coordinator IPv4:PORT]\n"
-          "Default coordinator: 127.0.0.1:9000\n", stream);
+    fprintf(stream, "Usage: faultline-worker [--coordinator IPv4:PORT] "
+            "[--heartbeat-interval-ms MS]\n"
+            "Default coordinator: 127.0.0.1:9000; heartbeat interval: %d ms\n"
+            "MS must be a positive decimal integer in 1..INT_MAX.\n",
+            FAULTLINE_DEFAULT_HEARTBEAT_INTERVAL_MS);
 }
 
-/* Return 1 for socket activity, 0 for a stop request, or -1 on error/timeout. */
+enum wait_result { WAIT_ERROR = -1, WAIT_STOP, WAIT_INPUT, WAIT_DEADLINE };
+
+/* The same interruptible wait serves both ACK expiry and heartbeat scheduling. */
 static int wait_for_input(int fd, int64_t deadline)
 {
     struct pollfd descriptor = {.fd = fd, .events = POLLIN};
@@ -42,8 +47,7 @@ static int wait_for_input(int fd, int64_t deadline)
                 return -1;
             }
             if (now >= deadline) {
-                errno = ETIMEDOUT;
-                return -1;
+                return WAIT_DEADLINE;
             }
             if (deadline - now < timeout) {
                 timeout = (int)(deadline - now);
@@ -85,6 +89,10 @@ static int receive_registration_ack(int fd, uint32_t *worker_id)
         int ready = wait_for_input(fd, start + FAULTLINE_IO_TIMEOUT_MS);
         ssize_t count;
 
+        if (ready == WAIT_DEADLINE) {
+            errno = ETIMEDOUT;
+            ready = WAIT_ERROR;
+        }
         if (ready <= 0) {
             if (ready < 0) {
                 perror("worker: receive registration ACK");
@@ -125,19 +133,50 @@ static int receive_registration_ack(int fd, uint32_t *worker_id)
     return 0;
 }
 
-static int wait_until_stopped(int fd)
+static int run_heartbeats(int fd, uint32_t worker_id, int interval_ms)
 {
+    const struct faultline_message heartbeat = {FAULTLINE_MSG_HEARTBEAT, worker_id};
+    uint8_t wire[FAULTLINE_HEADER_SIZE + FAULTLINE_HEARTBEAT_PAYLOAD_SIZE];
+    size_t written;
+    int64_t now = faultline_monotonic_ms();
+    int64_t next_heartbeat;
+
+    if (now < 0) {
+        perror("worker: clock");
+        return EXIT_FAILURE;
+    }
+    if (faultline_message_encode(wire, sizeof(wire), &heartbeat, &written) !=
+        FAULTLINE_PROTOCOL_OK) {
+        fputs("worker: could not encode heartbeat\n", stderr);
+        return EXIT_FAILURE;
+    }
+    next_heartbeat = now + interval_ms;
     while (!stopping) {
-        int ready = wait_for_input(fd, -1);
+        int ready = wait_for_input(fd, next_heartbeat);
         uint8_t byte;
         ssize_t count;
 
-        if (ready == 0) {
+        if (ready == WAIT_STOP) {
             break;
         }
-        if (ready < 0) {
+        if (ready == WAIT_ERROR) {
             perror("worker: wait for coordinator");
             return EXIT_FAILURE;
+        }
+        if (ready == WAIT_DEADLINE) {
+            if (faultline_send_all(fd, wire, written, FAULTLINE_IO_TIMEOUT_MS) < 0) {
+                perror("worker: send heartbeat");
+                return EXIT_FAILURE;
+            }
+            now = faultline_monotonic_ms();
+            if (now < 0) {
+                perror("worker: clock");
+                return EXIT_FAILURE;
+            }
+            printf("[INFO] worker heartbeat_sent worker_id=%" PRIu32 "\n", worker_id);
+            /* Schedule from completion; a delayed worker never sends a catch-up burst. */
+            next_heartbeat = now + interval_ms;
+            continue;
         }
         count = recv(fd, &byte, 1, 0);
         if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -160,6 +199,9 @@ int main(int argc, char **argv)
 {
     char host[INET_ADDRSTRLEN] = FAULTLINE_DEFAULT_HOST;
     uint16_t port = FAULTLINE_DEFAULT_PORT;
+    int interval_ms = FAULTLINE_DEFAULT_HEARTBEAT_INTERVAL_MS;
+    int endpoint_seen = 0;
+    int interval_seen = 0;
     uint32_t worker_id = FAULTLINE_WORKER_ID_UNASSIGNED;
     const struct faultline_message registration = {FAULTLINE_MSG_WORKER_REGISTER, 0};
     uint8_t wire[FAULTLINE_HEADER_SIZE];
@@ -172,10 +214,17 @@ int main(int argc, char **argv)
         usage(stdout);
         return EXIT_SUCCESS;
     }
-    if (argc != 1 && (argc != 3 || strcmp(argv[1], "--coordinator") != 0 ||
-                      faultline_parse_endpoint(argv[2], host, sizeof(host), &port) < 0)) {
-        usage(stderr);
-        return EXIT_FAILURE;
+    for (int i = 1; i < argc; i += 2) {
+        if (i + 1 < argc && strcmp(argv[i], "--coordinator") == 0 && !endpoint_seen &&
+            faultline_parse_endpoint(argv[i + 1], host, sizeof(host), &port) == 0) {
+            endpoint_seen = 1;
+        } else if (i + 1 < argc && strcmp(argv[i], "--heartbeat-interval-ms") == 0 &&
+                   !interval_seen && faultline_parse_duration_ms(argv[i + 1], &interval_ms) == 0) {
+            interval_seen = 1;
+        } else {
+            usage(stderr);
+            return EXIT_FAILURE;
+        }
     }
     (void)setvbuf(stdout, NULL, _IOLBF, 0);
     action.sa_handler = request_stop;
@@ -208,9 +257,10 @@ int main(int argc, char **argv)
     if (receive_registration_ack(fd, &worker_id) < 0 || stopping) {
         goto done;
     }
-    printf("[INFO] worker registered worker_id=%" PRIu32 " coordinator=%s:%u\n",
-           worker_id, host, (unsigned int)port);
-    status = wait_until_stopped(fd);
+    printf("[INFO] worker registered worker_id=%" PRIu32
+           " coordinator=%s:%u heartbeat_interval_ms=%d\n",
+           worker_id, host, (unsigned int)port, interval_ms);
+    status = run_heartbeats(fd, worker_id, interval_ms);
 
 done:
     (void)close(fd);

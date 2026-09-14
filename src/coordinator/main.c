@@ -255,7 +255,29 @@ static void accept_clients(int listener, struct client clients[MAX_CLIENTS],
     }
 }
 
-static int run_coordinator(int listener)
+static int heartbeat_poll_timeout(const struct faultline_worker_registry *registry,
+                                   int64_t now, int timeout_ms)
+{
+    int wait_ms = 1000;
+
+    for (size_t i = 0; i < FAULTLINE_MAX_WORKERS; ++i) {
+        const struct faultline_worker *worker = &registry->workers[i];
+
+        if (worker->state == FAULTLINE_WORKER_ALIVE) {
+            int64_t remaining = timeout_ms - (now - worker->last_heartbeat_ms);
+
+            if (remaining <= 0) {
+                return 0;
+            }
+            if (remaining < wait_ms) {
+                wait_ms = (int)remaining;
+            }
+        }
+    }
+    return wait_ms;
+}
+
+static int run_coordinator(int listener, int heartbeat_timeout_ms)
 {
     struct faultline_worker_registry registry;
     struct client clients[MAX_CLIENTS];
@@ -268,7 +290,13 @@ static int run_coordinator(int listener)
     }
     while (!stopping) {
         int ready;
-        int64_t now;
+        int64_t now = faultline_monotonic_ms();
+
+        if (now < 0) {
+            perror("coordinator: clock");
+            status = EXIT_FAILURE;
+            break;
+        }
 
         descriptors[0] = (struct pollfd){.fd = listener, .events = POLLIN};
         for (size_t i = 0; i < MAX_CLIENTS; ++i) {
@@ -277,7 +305,8 @@ static int run_coordinator(int listener)
                 .events = clients[i].phase == READING_MESSAGE ? POLLIN : POLLOUT
             };
         }
-        ready = poll(descriptors, MAX_CLIENTS + 1, 1000);
+        ready = poll(descriptors, MAX_CLIENTS + 1,
+                     heartbeat_poll_timeout(&registry, now, heartbeat_timeout_ms));
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -296,6 +325,16 @@ static int run_coordinator(int listener)
             short events = descriptors[i + 1].revents;
 
             if (clients[i].fd < 0) {
+                continue;
+            }
+            /* Expire before reading: late bytes cannot revive an expired identity. */
+            if (faultline_worker_timed_out(
+                    faultline_worker_find(&registry, clients[i].worker_id),
+                    now, heartbeat_timeout_ms)) {
+                printf("[INFO] coordinator heartbeat_timeout worker_id=%" PRIu32
+                       " fd=%d timeout_ms=%d\n", clients[i].worker_id,
+                       clients[i].fd, heartbeat_timeout_ms);
+                close_client(&clients[i], &registry, "heartbeat_timeout");
                 continue;
             }
             if ((events & POLLNVAL) != 0) {
@@ -335,21 +374,41 @@ static int run_coordinator(int listener)
     return status;
 }
 
+static void usage(FILE *stream)
+{
+    fprintf(stream, "Usage: faultline-coordinator [--port PORT] "
+            "[--heartbeat-timeout-ms MS]\n"
+            "Default: 127.0.0.1:9000; heartbeat timeout: %d ms\n"
+            "PORT must be in 1..65535; MS in 1..INT_MAX (decimal integers).\n",
+            FAULTLINE_DEFAULT_HEARTBEAT_TIMEOUT_MS);
+}
+
 int main(int argc, char **argv)
 {
     uint16_t port = FAULTLINE_DEFAULT_PORT;
+    int heartbeat_timeout_ms = FAULTLINE_DEFAULT_HEARTBEAT_TIMEOUT_MS;
+    int port_seen = 0;
+    int timeout_seen = 0;
     struct sigaction action = {0};
     int listener;
     int status;
 
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
-        puts("Usage: faultline-coordinator [--port PORT]\nDefault: 127.0.0.1:9000");
+        usage(stdout);
         return EXIT_SUCCESS;
     }
-    if (argc != 1 && (argc != 3 || strcmp(argv[1], "--port") != 0 ||
-                      faultline_parse_port(argv[2], &port) < 0)) {
-        fputs("Usage: faultline-coordinator [--port PORT] (1..65535)\n", stderr);
-        return EXIT_FAILURE;
+    for (int i = 1; i < argc; i += 2) {
+        if (i + 1 < argc && strcmp(argv[i], "--port") == 0 && !port_seen &&
+            faultline_parse_port(argv[i + 1], &port) == 0) {
+            port_seen = 1;
+        } else if (i + 1 < argc && strcmp(argv[i], "--heartbeat-timeout-ms") == 0 &&
+                   !timeout_seen &&
+                   faultline_parse_duration_ms(argv[i + 1], &heartbeat_timeout_ms) == 0) {
+            timeout_seen = 1;
+        } else {
+            usage(stderr);
+            return EXIT_FAILURE;
+        }
     }
     (void)setvbuf(stdout, NULL, _IOLBF, 0);
     action.sa_handler = request_stop;
@@ -364,9 +423,9 @@ int main(int argc, char **argv)
         perror("coordinator: listen");
         return EXIT_FAILURE;
     }
-    printf("[INFO] coordinator listening address=%s port=%u\n",
-           FAULTLINE_DEFAULT_HOST, (unsigned int)port);
-    status = run_coordinator(listener);
+    printf("[INFO] coordinator listening address=%s port=%u heartbeat_timeout_ms=%d\n",
+           FAULTLINE_DEFAULT_HOST, (unsigned int)port, heartbeat_timeout_ms);
+    status = run_coordinator(listener, heartbeat_timeout_ms);
     (void)close(listener);
     puts("[INFO] coordinator stopped");
     return status;

@@ -42,6 +42,8 @@ def heartbeat(worker_id):
 
 
 class CoordinatorTestCase(unittest.TestCase):
+    COORDINATOR_ARGUMENTS = ()
+
     @classmethod
     def setUpClass(cls):
         cls.cli = str((BIN_DIR / "faultline").resolve())
@@ -58,6 +60,7 @@ class CoordinatorTestCase(unittest.TestCase):
         command = [cls.coordinator]
         if cls.port != 9000:
             command.extend(["--port", str(cls.port)])
+        command.extend(cls.COORDINATOR_ARGUMENTS)
         cls.server = subprocess.Popen(
             command,
             stdout=cls.log, stderr=cls.log,
@@ -450,11 +453,12 @@ class CoordinatorTests(CoordinatorTestCase):
             dead = self.wait_for_worker_event("worker_dead", partial_id)
             self.assertEqual(dead["reason"], "io_timeout")
             self.assertEqual(dead["last_heartbeat_ms"], partial_start["last_heartbeat_ms"])
-            # Idle registered workers await the future heartbeat timeout policy.
-            idle.sendall(PING)
-            self.assertEqual(receive_exact(idle, 12), PONG)
+            # Silence expires from registration even if the socket stays open.
+            idle.settimeout(3)
+            self.assert_closed(idle)
             self.assertEqual(self.worker_events("heartbeat_received", idle_id), [])
         idle_dead = self.wait_for_worker_event("worker_dead", idle_id)
+        self.assertEqual(idle_dead["reason"], "heartbeat_timeout")
         self.assertEqual(idle_dead["last_heartbeat_ms"], idle_start["last_heartbeat_ms"])
 
 

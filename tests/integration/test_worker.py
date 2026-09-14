@@ -20,12 +20,14 @@ def read_output(stream):
     return os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0).decode()
 
 
-class WorkerExecutableTests(test_ping.CoordinatorTestCase):
+class WorkerProcessTestCase(test_ping.CoordinatorTestCase):
     @contextmanager
-    def worker_process(self, port=None, arguments=None):
+    def worker_process(self, port=None, arguments=None, interval_ms=None):
         executable = str((test_ping.BIN_DIR / 'faultline-worker').resolve())
         if arguments is None:
             arguments = ['--coordinator', f'127.0.0.1:{port or self.port}']
+        if interval_ms is not None:
+            arguments = [*arguments, '--heartbeat-interval-ms', str(interval_ms)]
         with tempfile.TemporaryFile(mode='w+') as output, tempfile.TemporaryFile(mode='w+') as errors:
             process = subprocess.Popen([executable, *arguments], stdout=output, stderr=errors)
             try:
@@ -62,17 +64,18 @@ class WorkerExecutableTests(test_ping.CoordinatorTestCase):
         self.assertEqual(read_output(errors), '')
 
     @contextmanager
-    def fake_coordinator(self):
+    def fake_coordinator(self, interval_ms=None):
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             listener.listen(1)
             listener.settimeout(3)
-            with self.worker_process(listener.getsockname()[1]) as (process, output, errors):
+            with self.worker_process(listener.getsockname()[1], interval_ms=interval_ms) as (process, output, errors):
                 with listener.accept()[0] as connection:
                     connection.settimeout(2)
                     self.assertEqual(test_ping.receive_exact(connection, 12), test_ping.REGISTER)
                     yield connection, process, output, errors
 
+class WorkerExecutableTests(WorkerProcessTestCase):
     def test_two_workers_get_distinct_ids(self):
         with self.worker_process() as (first, first_output, first_errors), \
                 self.worker_process() as (second, second_output, second_errors):

@@ -166,6 +166,38 @@ static int test_invalid_arguments(void)
     return EXIT_SUCCESS;
 }
 
+static int test_heartbeat_expiration(void)
+{
+    struct faultline_worker_registry registry;
+    uint32_t id;
+
+    faultline_worker_registry_init(&registry);
+    CHECK(!faultline_worker_timed_out(&registry.workers[0], 7000, 6000));
+    CHECK(faultline_worker_register(&registry, 7, 1000, &id) == FAULTLINE_REGISTRY_OK);
+    const struct faultline_worker *worker = faultline_worker_find(&registry, id);
+    CHECK(!faultline_worker_timed_out(worker, 6999, 6000));
+    CHECK(faultline_worker_timed_out(worker, 7000, 6000));
+    CHECK(faultline_worker_timed_out(worker, 7001, 6000));
+    CHECK(worker->state == FAULTLINE_WORKER_ALIVE && worker->fd == 7);
+    CHECK(!faultline_worker_timed_out(worker, 999, 6000));
+    CHECK(!faultline_worker_timed_out(worker, -1, 6000));
+    CHECK(!faultline_worker_timed_out(worker, 7000, 0));
+    CHECK(!faultline_worker_timed_out(worker, 7000, -1));
+    CHECK(!faultline_worker_timed_out(NULL, 7000, 6000));
+    CHECK(faultline_worker_heartbeat(&registry, id, 7, 3000) == FAULTLINE_REGISTRY_OK);
+    CHECK(!faultline_worker_timed_out(worker, 8999, 6000));
+    CHECK(faultline_worker_timed_out(worker, 9000, 6000));
+    CHECK(!faultline_worker_timed_out(worker, 3000, 1));
+    CHECK(faultline_worker_timed_out(worker, 3001, 1));
+    CHECK(faultline_worker_mark_dead(&registry, id, 7) == FAULTLINE_REGISTRY_OK);
+    CHECK(!faultline_worker_timed_out(worker, 9000, 6000));
+    CHECK(faultline_worker_register(&registry, 7, INT64_MAX - 10, &id) == FAULTLINE_REGISTRY_OK);
+    worker = faultline_worker_find(&registry, id);
+    CHECK(!faultline_worker_timed_out(worker, INT64_MAX - 1, 10));
+    CHECK(faultline_worker_timed_out(worker, INT64_MAX, 10));
+    return EXIT_SUCCESS;
+}
+
 int main(void)
 {
     const struct {
@@ -177,7 +209,8 @@ int main(void)
         {"disconnect and descriptor reuse", test_disconnect_and_descriptor_reuse},
         {"registry capacity, duplicates, and churn", test_capacity_duplicates_and_churn},
         {"worker ID exhaustion", test_id_exhaustion},
-        {"registry invalid arguments", test_invalid_arguments}
+        {"registry invalid arguments", test_invalid_arguments},
+        {"heartbeat expiration boundary and renewal", test_heartbeat_expiration}
     };
 
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {

@@ -7,6 +7,8 @@
 #define FAULTLINE_DEFAULT_HOST "127.0.0.1"
 #define FAULTLINE_DEFAULT_PORT UINT16_C(9000)
 #define FAULTLINE_IO_TIMEOUT_MS 5000
+#define FAULTLINE_DEFAULT_HEARTBEAT_INTERVAL_MS 2000
+#define FAULTLINE_DEFAULT_HEARTBEAT_TIMEOUT_MS 6000
 
 enum faultline_receive_result {
     FAULTLINE_RECEIVE_OK = 0,
@@ -17,6 +19,8 @@ enum faultline_receive_result {
 
 /* Helpers return -1 on error and set errno. Ports must be decimal 1..65535. */
 int faultline_parse_port(const char *text, uint16_t *port);
+/* Decimal milliseconds in 1..INT_MAX; errors leave the output unchanged. */
+int faultline_parse_duration_ms(const char *text, int *duration_ms);
 /* Parse numeric IPv4:PORT into non-overlapping outputs; errors leave both unchanged. */
 int faultline_parse_endpoint(const char *text, char *host, size_t host_size,
                              uint16_t *port);

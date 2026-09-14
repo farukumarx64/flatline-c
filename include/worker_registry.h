@@ -58,6 +58,14 @@ enum faultline_registry_result faultline_worker_register(
 const struct faultline_worker *faultline_worker_find(
     const struct faultline_worker_registry *registry, uint32_t worker_id);
 
+/*
+ * Read-only predicate: true at/after the deadline of an ALIVE record.
+ * NULL, invalid times, and nonpositive timeouts return false. Does not close or
+ * mark dead; the coordinator owns that transition and the socket cleanup.
+ */
+int faultline_worker_timed_out(const struct faultline_worker *worker,
+                              int64_t now_ms, int timeout_ms);
+
 /* Require the same ALIVE ID/connection pair. Errors leave the record unchanged. */
 enum faultline_registry_result faultline_worker_heartbeat(
     struct faultline_worker_registry *registry, uint32_t worker_id, int fd,
