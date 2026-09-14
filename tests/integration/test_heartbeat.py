@@ -65,37 +65,6 @@ class HeartbeatTests(WorkerProcessTestCase):
                 start = now
             self.stop_worker(process, errors, signal.SIGINT)
 
-    def test_paused_worker_expires_while_other_worker_keeps_running(self):
-        with self.worker_process(interval_ms=80) as (first, first_output, first_errors), \
-                self.worker_process(interval_ms=150) as (second, second_output, second_errors):
-            first_id = self.wait_for_registration(first, first_output, first_errors)
-            second_id = self.wait_for_registration(second, second_output, second_errors)
-            time.sleep(1.7)  # Both stay alive through more than two timeout windows.
-            for process, worker_id in ((first, first_id), (second, second_id)):
-                self.assertIsNone(process.poll())
-                self.assertGreater(len(self.worker_events('heartbeat_received', worker_id)), 3)
-                self.assertEqual(self.worker_events('worker_dead', worker_id), [])
-            first.send_signal(signal.SIGSTOP)
-            try:
-                dead = self.wait_for_worker_event('worker_dead', first_id)
-                self.assertEqual(dead['reason'], 'heartbeat_timeout')
-                self.assertEqual(dead['state'], 'DEAD')
-                self.assertEqual(len(self.worker_events('worker_dead', first_id)), 1)
-                self.assertEqual(self.worker_events('worker_dead', second_id), [])
-                self.assertIsNone(second.poll())
-                self.assert_pong(self.run_cli())
-            finally:
-                # A stopped child cannot handle SIGTERM; always resume before cleanup.
-                first.send_signal(signal.SIGCONT)
-            self.assertEqual(first.wait(timeout=2), 1)
-            self.assertIn('worker:', read_output(first_errors))
-            with self.worker_process(interval_ms=80) as (replacement, output, errors):
-                new_id = self.wait_for_registration(replacement, output, errors)
-                self.assertNotIn(new_id, (first_id, second_id))
-                self.wait_for_worker_event('heartbeat_received', new_id)
-                self.stop_worker(replacement, errors)
-            self.stop_worker(second, second_errors)
-
     def test_complete_heartbeat_renews_deadline(self):
         with self.connect() as connection:
             worker_id = self.register_worker(connection)

@@ -29,7 +29,7 @@ PROGRAMS := $(BUILD_DIR)/faultline-coordinator \
 	$(BUILD_DIR)/faultline-worker $(BUILD_DIR)/faultline
 TEST_PROGRAMS := $(addprefix $(BUILD_DIR)/tests/,$(TEST_NAMES))
 
-.PHONY: all sanitize test test-unit test-integration test-sanitize clean
+.PHONY: all sanitize test test-unit test-integration test-failures test-sanitize clean
 
 all: $(PROGRAMS)
 
@@ -44,10 +44,13 @@ test-unit: $(TEST_PROGRAMS)
 	./$(BUILD_DIR)/tests/test_net
 	./$(BUILD_DIR)/tests/test_worker_registry
 
-test-integration: all
+test-integration: all test-failures
 	$(PYTHON) tests/integration/test_ping.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
 	$(PYTHON) tests/integration/test_worker.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
 	$(PYTHON) tests/integration/test_heartbeat.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
+
+test-failures: all
+	$(PYTHON) tests/integration/test_failure_detection.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
 
 test-sanitize:
 	$(MAKE) SANITIZE=1 test

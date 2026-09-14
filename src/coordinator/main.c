@@ -323,17 +323,19 @@ static int run_coordinator(int listener, int heartbeat_timeout_ms)
         }
         for (size_t i = 0; i < MAX_CLIENTS && !stopping; ++i) {
             short events = descriptors[i + 1].revents;
+            const struct faultline_worker *worker;
 
             if (clients[i].fd < 0) {
                 continue;
             }
+            worker = faultline_worker_find(&registry, clients[i].worker_id);
             /* Expire before reading: late bytes cannot revive an expired identity. */
-            if (faultline_worker_timed_out(
-                    faultline_worker_find(&registry, clients[i].worker_id),
-                    now, heartbeat_timeout_ms)) {
+            if (faultline_worker_timed_out(worker, now, heartbeat_timeout_ms)) {
                 printf("[INFO] coordinator heartbeat_timeout worker_id=%" PRIu32
-                       " fd=%d timeout_ms=%d\n", clients[i].worker_id,
-                       clients[i].fd, heartbeat_timeout_ms);
+                       " fd=%d timeout_ms=%d detected_at_ms=%" PRId64
+                       " silence_ms=%" PRId64 "\n", clients[i].worker_id,
+                       clients[i].fd, heartbeat_timeout_ms, now,
+                       now - worker->last_heartbeat_ms);
                 close_client(&clients[i], &registry, "heartbeat_timeout");
                 continue;
             }

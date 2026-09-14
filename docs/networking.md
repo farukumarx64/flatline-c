@@ -197,6 +197,10 @@ bytes cannot revive an expired ID. Scheduling delays can postpone the check, so
 this is not a hard real-time guarantee. An expired client follows the same cleanup
 path as a disconnect: mark DEAD, clear its descriptor, then close its socket.
 Its death log uses `reason=heartbeat_timeout`.
+The preceding `heartbeat_timeout` event includes `timeout_ms`, `detected_at_ms`,
+and `silence_ms`. Detection time is the coordinator's monotonic clock value;
+silence is that value minus the worker's retained `last_heartbeat_ms`. These
+fields make the timeout decision inspectable without comparing clocks across processes.
 
 All elapsed-time calculations use `CLOCK_MONOTONIC`, which avoids wall-clock
 adjustments affecting timeouts.

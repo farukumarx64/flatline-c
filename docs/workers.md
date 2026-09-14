@@ -152,7 +152,65 @@ A timeout means the coordinator considers this registration unavailable. It does
 not prove the process crashed: a pause, network delay, or overloaded machine can
 produce the same observation. This distinction will matter when retrying jobs.
 
-## Observe a worker timeout
+## Verify failure detection
+
+Failure detection has two inputs: a socket reporting disconnection and a worker
+missing its heartbeat deadline. Both mark the registration DEAD and close its
+connection through the same coordinator cleanup path.
+
+| Experiment | What the coordinator observes | Expected death reason in the tests |
+| --- | --- | --- |
+| Stop a real worker with SIGTERM | Worker handles the signal, closes its socket, and exits successfully | `eof` |
+| Kill a real worker with SIGKILL | OS terminates the process and closes its sockets | `eof` |
+| Reset a registered test peer's connection | TCP receive fails | `recv_error` |
+| Stop heartbeats while leaving the test peer's socket open | No disconnect; heartbeat deadline elapses | `heartbeat_timeout` |
+| Pause a real worker with SIGSTOP | Process remains present and socket stays open; heartbeats cease | `heartbeat_timeout` |
+
+Run these cases together:
+
+```sh
+make test-failures
+make SANITIZE=1 test-failures
+```
+
+They are also included in `make test` and `make test-sanitize`. The new suite
+adds explicit graceful-exit, forced-exit, TCP-reset, and stopped-heartbeat cases;
+the earlier real-worker pause test now lives there with stronger assertions.
+
+Connection-loss cases require detection within 2.5 seconds of triggering the
+failure, well before the default six-second heartbeat timeout, and assert that
+no heartbeat-timeout event occurred. These are local acceptance bounds with
+scheduling slack, not a production latency guarantee. An application exit does
+not imply a TCP reset: even SIGKILL can appear as orderly EOF because the OS
+closes the socket. The explicit reset case exercises the receive-error path.
+
+For heartbeat-based detection, a controlled peer first sends two valid heartbeats
+and then sends nothing. It never closes or shuts down its connection before
+the coordinator closes it. The test verifies the connection stays open before
+expiry, its last heartbeat time stops changing, and detection occurs after the
+configured six seconds of silence. The separate SIGSTOP experiment exercises
+the real worker executable with a 750 ms timeout and confirms that it has not
+exited when the coordinator marks it dead.
+
+Each case keeps a second real worker running. Tests require a new heartbeat from
+that surviving worker after failure detection and a successful CLI PING/PONG.
+They check the failed ID has exactly one death event. Worker-exit and pause cases
+also verify that a replacement can register with a fresh ID. Paused processes
+are resumed in `finally` blocks so test cleanup can stop them reliably.
+
+Timeout diagnostics now include:
+
+| Field | Meaning |
+| --- | --- |
+| `timeout_ms` | Configured silence limit. |
+| `detected_at_ms` | Coordinator's monotonic time when it checks expiry. |
+| `silence_ms` | Time since the latest accepted heartbeat or initial registration. |
+
+The tests check `silence_ms >= timeout_ms` and that subtracting the death event's
+`last_heartbeat_ms` from `detected_at_ms` reproduces `silence_ms`. Logs distinguish
+the reason for failure without claiming the remote process necessarily crashed.
+
+## Observe a worker timeout manually
 
 With a coordinator already running, use a worker terminal:
 

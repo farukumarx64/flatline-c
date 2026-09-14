@@ -11,6 +11,8 @@ These run protocol, registry, and socket unit tests written in C plus process in
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
+Use `make test-failures` for the dedicated failure-detection suite, or
+`make SANITIZE=1 test-failures` for the same checks against instrumented binaries.
 
 `test_protocol.c` has seven test groups:
 
@@ -129,16 +131,12 @@ suites share coordinator setup, cleanup, and protocol helpers through the
 Worker subprocesses are always cleaned up, and their stderr is checked for
 AddressSanitizer/UBSan reports.
 
-`integration/test_heartbeat.py` adds eight timing and failure scenarios:
+`integration/test_heartbeat.py` contains seven timing scenarios:
 
 - Default two-second heartbeat cadence keeps a real worker alive past six
   seconds while an open, silent registration expires after the default timeout.
 - A controlled peer independently checks repeated exact 16-byte heartbeat frames
   at a 120 ms interval; a partial ACK must not start heartbeat sending.
-- Two workers with different intervals survive multiple 750 ms timeout windows.
-  Pausing one with SIGSTOP leaves its socket open, then expires only that worker.
-  The other worker and CLI continue; resuming the expired worker fails and a
-  replacement gets a fresh ID.
 - A valid heartbeat renews the deadline beyond the original registration deadline.
 - PING traffic and trickled heartbeat header/payload bytes cannot renew liveness.
 - A worker configured to send more slowly than the timeout expires before its
@@ -153,8 +151,33 @@ by deterministic C tests. Every paused process is resumed in a `finally` block
 before normal cleanup. The heartbeat suite uses both default timings and a
 shorter coordinator timeout for focused scenarios; each fixture owns its processes.
 
+`integration/test_failure_detection.py` contains five failure scenarios:
+
+- A registered real worker exits successfully on SIGTERM; EOF marks it dead.
+- A registered real worker is terminated by SIGKILL; its exit status confirms
+  forced termination and EOF marks it dead without waiting for heartbeats.
+- A registered Python peer closes with zero SO_LINGER, causing a TCP reset;
+  the coordinator marks its registration dead with `reason=recv_error`.
+- A registered Python peer sends two valid heartbeats, then remains open without
+  sending more data. The coordinator must close it after six seconds of silence.
+- The real-worker SIGSTOP case, moved from the heartbeat suite, keeps two workers
+  alive for multiple timeout periods, pauses one, and requires only that ID to
+  expire. The paused process must still be present when detection occurs.
+
+Transport failures must be detected within 2.5 seconds of fault injection with
+no `heartbeat_timeout` event. Timeout cases check the coordinator's monotonic
+`detected_at_ms` and `silence_ms` diagnostics against its last recorded heartbeat
+and configured timeout. Each case verifies one death event for the failed ID,
+continuing heartbeat progress by a healthy worker, and a usable CLI. Real-worker
+exit/pause cases check that freed slots accept fresh IDs. The peer silence case
+does not call `close()` or `shutdown()` before coordinator-initiated closure.
+SIGSTOP cleanup always resumes the process before trying to stop it.
+
+The focused command prints each detected reason and elapsed observation time or
+heartbeat silence duration. The full integration target includes this suite once.
+
 By default, suites select available ports. The original coordinator and worker
-suites each skip one default-endpoint check. To run all 40 scenarios, stop any existing
+suites each skip one default-endpoint check. To run all 44 scenarios, stop any existing
 coordinator on port 9000 and run:
 
 ```sh

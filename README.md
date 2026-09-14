@@ -16,6 +16,10 @@ prints its assigned ID, and sends a heartbeat every two seconds. The coordinator
 expires a worker after six seconds without a valid heartbeat. Both durations are
 configurable. Job execution and persistence are future work.
 
+Dedicated failure tests distinguish worker exit and TCP reset from missed
+heartbeats on an open connection. A healthy worker and the CLI must remain usable
+in every case; timeout logs report the measured silence duration.
+
 ## Build and run
 
 Requirements: Make and a C11 compiler such as Clang or GCC. The project targets
@@ -111,6 +115,8 @@ make test-sanitize
 Both commands build and run C unit tests and Python integration tests against
 the real executables. `test-sanitize` instruments all C programs under test.
 Use `make test-unit` or `make test-integration` to run either layer separately.
+Use `make test-failures` to run only the five failure-detection scenarios, or
+`make SANITIZE=1 test-failures` to run them with AddressSanitizer/UBSan.
 
 Integration tests normally choose an available loopback port, leaving the
 default-endpoint checks skipped. To also exercise all three programs' port 9000
