@@ -2,8 +2,9 @@
 
 The job model is defined in `include/job.h`, with coordinator-owned operations
 in `src/coordinator/job.c`. It describes one job and enforces changes to that
-record. It does not yet create a job queue, allocate globally unique IDs, send
-job messages, execute tasks, or connect worker failure detection to retries.
+record. A separate [FIFO queue](queue.md) now stores pending job IDs. The model
+does not allocate globally unique IDs, send job messages, execute tasks, or
+connect worker failure detection to retries.
 
 ## What a job contains
 
@@ -145,7 +146,8 @@ Future messages must carry the attempt along with job identity, and their handle
 must validate the sending connection before calling these operations.
 
 These are record transitions only. Calling fail does not insert anything into
-a FIFO, send another assignment, or run another task. Automatic retry, leases,
+a FIFO, send another assignment, or run another task. An explicit successful
+queue push would add the retried ID to the back. Automatic retry, leases,
 worker-death integration, and recovery remain later work. The model preserves
 only the current/latest attempt's metadata, not a full attempt history.
 

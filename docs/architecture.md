@@ -13,8 +13,10 @@ Disconnected or timed-out workers are marked dead. The worker executable connect
 registers, validates its assigned ID, and sends periodic heartbeats. Worker interval
 and coordinator timeout are configurable, defaulting to two and six seconds.
 The [job model](jobs.md) defines records and validated state transitions, including
-attempt identity and bounded requeue/failure rules. Queuing, job messages,
-scheduling, execution, automatic retries, and recovery have not been implemented yet.
+attempt identity and bounded requeue/failure rules. The [FIFO queue](queue.md)
+holds pending IDs in insertion order independently of full job records. Job
+messages, the job store, scheduling, execution, automatic retries, and recovery
+have not been implemented yet.
 
 ## Components and ownership
 

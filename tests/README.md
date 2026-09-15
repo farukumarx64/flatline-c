@@ -7,7 +7,7 @@ make test
 make test-sanitize
 ```
 
-These run protocol, registry, job, and socket unit tests written in C plus process integration
+These run protocol, registry, job, queue, and socket unit tests written in C plus process integration
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
@@ -95,8 +95,30 @@ Stale IDs cannot update or kill its replacement worker. Churn exceeds the
   beyond UINT32_MAX attempts, without billions of iterations or counter wrap.
 
 These tests need no sockets or sleeps. They verify model-level transitions only;
-there is no job submission, queue, executor, or automatic retry in the running
-programs yet. The job model links only into the coordinator and its test binary.
+there is no job submission, executor, or automatic retry in the running
+programs yet. The job model links into the coordinator and the job/queue test
+binaries; the CLI and worker do not link its transition implementation.
+
+`test_job_queue.c` adds seven FIFO test groups:
+
+- Empty initialization, empty peek/pop, null arguments, and unchanged output IDs.
+- Insertion order using unsorted IDs/timestamps and UINT64_MAX; push/pop leave
+  the complete job records and their payloads unchanged.
+- Repeated peeks while waiting and rejected assignments leave the front intact;
+  successful model assignment followed by pop removes the intended ID.
+- Duplicate IDs from the same or different records; rejection of assigned,
+  running, done, failed, and malformed job records.
+- Exactly 256 pending IDs; overflow preserves every existing entry and the
+  proposed job; duplicate checking also works when full.
+- Repeated half-drain/refill cycles, array wraparound, duplicate detection across
+  the boundary, complete FIFO draining, and reuse after becoming empty.
+- A model-level retry retains its ID and joins the back after explicit enqueue.
+
+These tests use no sockets, sleeps, or scheduler. Most FIFO-only fixtures create
+temporary job records to verify that the queue copies IDs and retains no pointers.
+Application code must keep authoritative records in its own store. Queue code
+links into the coordinator and its test binary; the queue tests also link the
+job model to exercise assignment and retry ordering.
 
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
 Its original 15 scenarios cover a successful exchange and sequential clients, default

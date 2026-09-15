@@ -22,9 +22,10 @@ in every case; timeout logs report the measured silence duration.
 
 An in-memory job model now defines task types, owned arguments/results, states,
 worker assignments, attempt numbers, timestamps, and bounded retry transitions.
-Its operations reject invalid transitions and stale reports. Jobs are not yet
-submitted or executed by the running programs; the FIFO queue and job message
-handlers come next.
+Its operations reject invalid transitions and stale reports. A coordinator FIFO
+module now holds up to 256 pending job IDs, preserves insertion order, and rejects
+duplicates or overflow. Jobs are not yet submitted or executed by the running
+programs; job messages, the job store, and scheduling will connect these pieces.
 
 ## Build and run
 
@@ -144,14 +145,15 @@ faultline/
 │   ├── protocol.md
 │   ├── networking.md
 │   ├── workers.md
-│   └── jobs.md
+│   ├── jobs.md
+│   └── queue.md
 ├── include/             Shared C headers
 ├── src/
 │   ├── common/          Shared protocol, networking, and logging code
-│   ├── coordinator/     Event loop, worker registry, and job model
+│   ├── coordinator/     Event loop, worker registry, job model, and FIFO queue
 │   ├── worker/          Worker registration and periodic heartbeats
 │   └── cli/             Client entry point and future implementation
-└── tests/               Protocol/registry/job/socket unit tests and TCP integration tests
+└── tests/               Protocol/registry/job/queue/socket tests and TCP integration tests
 ```
 
 Read [the architecture note](docs/architecture.md) for component responsibilities,
@@ -162,5 +164,5 @@ explains the PING/PONG exchange, connection state, partial I/O, and deadlines.
 The [worker guide](docs/workers.md) describes the registration exchange, worker
 IDs, connection ownership, and heartbeat timing. The [job guide](docs/jobs.md)
 defines the record, state transitions, attempt identity, and retry limits.
-The next step is the coordinator's FIFO job queue, followed by job messages and
-assignment to available workers.
+The [queue guide](docs/queue.md) explains FIFO ordering, capacity, and job ownership.
+Next come job messages, submission/storage, and assignment to available workers.
