@@ -10,6 +10,9 @@ heartbeats. The worker executable sends WORKER_REGISTER, validates the ACK heade
 and ID payload, and uses its assigned ID in periodic HEARTBEAT messages. Timing
 configuration and expiration policy are described in [workers.md](workers.md);
 they add no fields to the wire format. Integration tests also use independent TCP peers.
+Job submission, acknowledgment, assignment, started, completed, and failed
+messages are also defined and tested in the shared codec. Their runtime handlers
+are pending; see the [job message specification](job-protocol.md).
 
 ## Header layout
 
@@ -20,7 +23,7 @@ fields use unsigned, big-endian encoding, also called network byte order.
 | --- | --- | --- | --- |
 | 0 | 4 bytes | Magic | `0x464c494e`, the ASCII bytes `FLIN` |
 | 4 | 2 bytes | Version | `1` |
-| 6 | 2 bytes | Message type | IDs `1` through `5`, listed below |
+| 6 | 2 bytes | Message type | IDs `1` through `11`, listed below |
 | 8 | 4 bytes | Payload length | `0` through `1,048,576` bytes inclusive |
 
 ```text
@@ -34,7 +37,7 @@ field size         4          2      2        4          length bytes
 The payload length excludes the 12-byte header. A zero-length payload is valid
 at the header layer; its whole frame is 12 bytes. The maximum frame allowed by
 the header's length limit is 1,048,588 bytes: a 1 MiB payload plus the header.
-Current message formats impose much smaller exact lengths. The 1 MiB limit is an initial
+Current message formats impose much smaller fixed lengths or bounded variable lengths. The 1 MiB limit is an initial
 project policy that bounds individual messages even though the length field can
 represent much larger values. It does not bound total buffered data across
 connections; that is a later transport concern.
@@ -44,8 +47,8 @@ authentication mechanism. The version selects the interpretation of the
 protocol and is independent of the application's eventual `v0.1.0` release tag.
 An unsupported version is rejected; version negotiation is not implemented.
 
-Zero and IDs outside the table below are rejected. Job and query messages will
-receive explicit IDs when their payload formats are designed. Existing IDs must
+Zero and IDs outside the table below are rejected. Query messages will receive
+explicit IDs when their payload formats are designed. Existing IDs must
 not be renumbered. Enum storage layout is never used as the wire representation.
 
 ## Messages and payloads
@@ -57,6 +60,16 @@ not be renumbered. Enum storage layout is never used as the wire representation.
 | 3 | `WORKER_REGISTER` | Worker to coordinator | Empty: 0 bytes | 12 bytes |
 | 4 | `WORKER_REGISTER_ACK` | Coordinator to worker | `worker_id`: 4-byte unsigned big-endian integer | 16 bytes |
 | 5 | `HEARTBEAT` | Worker to coordinator | `worker_id`: 4-byte unsigned big-endian integer | 16 bytes |
+| 6 | `JOB_SUBMIT` | CLI to coordinator | Task, retry limit, argument length and bytes | 22–1046 bytes |
+| 7 | `JOB_SUBMIT_ACK` | Coordinator to CLI | Nonzero 8-byte job ID | 20 bytes |
+| 8 | `JOB_ASSIGN` | Coordinator to worker | Job/worker/attempt identity, task, arguments | 38–1062 bytes |
+| 9 | `JOB_STARTED` | Worker to coordinator | Job/worker/attempt identity | 32 bytes |
+| 10 | `JOB_COMPLETED` | Worker to coordinator | Identity, result length and bytes | 36–1060 bytes |
+| 11 | `JOB_FAILED` | Worker to coordinator | Identity and TASK failure code | 34 bytes |
+
+See [job-protocol.md](job-protocol.md) for every job field's byte offset, acceptance
+and report semantics, retry identity, and validation rules. The following worker
+lifecycle discussion describes the currently active TCP handlers.
 
 `WORKER_REGISTER` requests an identity. It does not propose an ID or carry
 metadata: MVP workers all execute one job at a time, so capacity negotiation is
@@ -64,7 +77,7 @@ not needed for this first format. `WORKER_REGISTER_ACK` represents successful
 registration and carries the coordinator-issued ID. There is no rejection
 payload or separate registration-error message in this step.
 
-Both nonempty payloads have one field at payload offset 0 (frame offset 12):
+Both worker ID payloads have one field at payload offset 0 (frame offset 12):
 `worker_id`, exactly 4 bytes, with accepted values `1` through `4,294,967,295`.
 Zero is reserved for an unregistered worker and is invalid in an ACK or
 heartbeat. Worker IDs identify registrations; they are not socket descriptors,
@@ -98,8 +111,8 @@ itself only validates byte structure and ID range. Disconnects and timeouts mark
 worker dead and clear its descriptor. A heartbeat cannot revive an old registration.
 
 The header functions only check that a type is recognized and a length is
-bounded. The complete-message functions additionally enforce the exact lengths
-in the table. For example, a header declaring a 3-byte ACK is rejected at the
+bounded. The complete-message functions additionally enforce each fixed length
+or variable-length formula in the table. For example, a header declaring a 3-byte ACK is rejected at the
 message layer immediately; an ACK declaring 4 bytes with only 3 received is
 incomplete and needs more input.
 
@@ -176,8 +189,10 @@ the wire buffer and does not require that buffer to be aligned for integers.
 
 ### Complete-message API
 
-`struct faultline_message` holds the host-order message type and worker ID.
-The ID must be zero for empty messages and nonzero for ACK and HEARTBEAT.
+`struct faultline_message` holds the host-order message type and a tagged union
+named `payload`. Its `worker_id` member must be zero for empty messages and
+nonzero for worker ACK and HEARTBEAT. Job types select their own union members;
+see [the job representation](job-protocol.md#c-representation-and-validation).
 The complete-message encoder derives magic, version, and payload length; callers
 do not fill those fields or encode the header separately.
 
@@ -196,7 +211,7 @@ For example, encode an acknowledgment with an already-assigned ID:
 ```c
 struct faultline_message ack = {
     .message_type = FAULTLINE_MSG_WORKER_REGISTER_ACK,
-    .worker_id = 12
+    .payload.worker_id = 12
 };
 uint8_t wire[FAULTLINE_HEADER_SIZE + FAULTLINE_WORKER_REGISTER_ACK_PAYLOAD_SIZE];
 size_t written = 0;
@@ -206,9 +221,9 @@ enum faultline_protocol_result result =
 ```
 
 These functions work on caller-owned byte buffers. They perform no socket I/O,
-allocate no memory, and do not assign IDs. The worker ID member represents the
-payload for the current two messages that carry data; future job payloads will
-need their own representation and validation.
+allocate no heap memory, and do not assign IDs. Variable argument/result bytes
+are copied into the message's own bounded arrays on decode; the caller can then
+reuse the receive buffer. Only the member selected by the type should be read.
 
 ## Validation and buffer ownership
 
@@ -225,7 +240,7 @@ Header validation proceeds in the following order and returns the first error:
 | `FAULTLINE_PROTOCOL_BUFFER_TOO_SMALL` | Fewer than 12 input bytes or output bytes of capacity. |
 | `FAULTLINE_PROTOCOL_BAD_MAGIC` | Magic does not match `FLIN`. |
 | `FAULTLINE_PROTOCOL_UNSUPPORTED_VERSION` | Version is not 1. |
-| `FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE` | Type is not one of the five defined message IDs. |
+| `FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE` | Type is not one of the eleven defined message IDs. |
 | `FAULTLINE_PROTOCOL_PAYLOAD_TOO_LARGE` | Declared payload exceeds 1 MiB. |
 | `FAULTLINE_PROTOCOL_OK` | Header was successfully encoded or decoded. |
 
@@ -237,24 +252,32 @@ On success, encoding writes exactly 12 bytes and leaves any extra capacity
 untouched. Decoding reads only the first 12 bytes and ignores trailing input.
 It does not consume a stream buffer or report payload completion.
 
-The complete-message functions have two additional errors:
+The complete-message functions have these additional errors:
 
 | Result | Meaning |
 | --- | --- |
-| `FAULTLINE_PROTOCOL_INVALID_PAYLOAD_LENGTH` | The declared length differs from the message's exact required length. |
-| `FAULTLINE_PROTOCOL_INVALID_WORKER_ID` | ACK/HEARTBEAT has ID zero, or an empty message's host representation supplies a nonzero ID. |
+| `FAULTLINE_PROTOCOL_INVALID_PAYLOAD_LENGTH` | The declared length differs from the required fixed length or prefix + data length. |
+| `FAULTLINE_PROTOCOL_INVALID_WORKER_ID` | Worker ACK/HEARTBEAT or job identity has ID zero, or an empty message supplies a nonzero ID. |
+| `FAULTLINE_PROTOCOL_INVALID_JOB_ID` | A job ACK or job identity has job ID zero. |
+| `FAULTLINE_PROTOCOL_INVALID_ATTEMPT` | Assignment/report attempt is zero. |
+| `FAULTLINE_PROTOCOL_INVALID_TASK_TYPE` | Submission/assignment task type is unknown. |
+| `FAULTLINE_PROTOCOL_INVALID_FAILURE` | A worker failure report contains a code other than TASK=1. |
 
-Message encoding checks pointers, message type, ID, and output capacity before
-writing. It returns `BUFFER_TOO_SMALL` if the entire frame will not fit, without
-writing even a partial header. Message decoding checks pointers, the header,
-the required payload length, availability of the complete frame, and the ID.
-A partial header or payload returns `BUFFER_TOO_SMALL`.
+Message encoding checks pointers, type, payload fields, byte counts, and output
+capacity before writing. It returns `BUFFER_TOO_SMALL` if the entire frame will
+not fit, without writing even a partial header. Message decoding checks the
+header and outer bounds, waits for the fixed prefix, validates its fields and
+inner length, then waits for any remaining variable data. Job argument/result
+sizes above 1024 also return `PAYLOAD_TOO_LARGE`, even below the header's 1 MiB
+ceiling. See the job specification for exact validation behavior.
 
 On any failure, message outputs and the `written`/`consumed` counters stay
-unchanged. On success, encoding reports exactly 12 or 16 bytes written and leaves
-extra capacity untouched. Decoding reports exactly one frame's size in
-`consumed`, ignores following bytes, and sets `worker_id` to zero for empty
-messages. The caller advances its own buffer only after a successful decode.
+unchanged. On success, encoding reports the full frame size and leaves extra
+capacity untouched. Decoding reports exactly one frame's size in `consumed`,
+ignores following bytes, and sets `payload.worker_id` to zero for empty messages.
+The caller advances its own buffer only after a successful decode. A partial
+valid header or payload returns `BUFFER_TOO_SMALL`; a declaration already known
+to be invalid is rejected without waiting for more bytes.
 
 ## Relationship to TCP framing
 
@@ -270,8 +293,9 @@ A short header is incomplete input, not necessarily a malformed message. The
 current coordinator keeps partial headers per connection, and the CLI uses
 `faultline_recv_exact()` to collect a response. Both detect EOF during a header.
 The coordinator first reads only the bytes remaining in one 12-byte header.
-If a valid message needs a payload, it then collects that payload in the same
-16-byte buffer before dispatching. Following frames stay in the socket's receive
+For a supported worker lifecycle payload, it then collects those bytes in the
+same 16-byte buffer before dispatching. Job payloads exceed this runtime buffer
+and are rejected from their header until job transport and handlers are added. Following frames stay in the socket's receive
 buffer until the coordinator is ready for them. Incorrect lengths are rejected
 as soon as the header is complete.
 
@@ -300,7 +324,10 @@ and process integration tests additionally exercise partial transfers,
 timeouts, concurrent clients, malformed messages, and disconnected peers.
 
 Seven additional complete-message test groups cover literal frames for all five
-types, worker ID boundaries, every incomplete frame prefix (including payload
+lifecycle types, worker ID boundaries, every incomplete frame prefix (including payload
 truncation), short output buffers, wrong lengths, invalid IDs/headers, null
 arguments, unaligned buffers, untouched outputs, and consecutive complete frames
 followed by a heartbeat completed in fragments.
+
+Eight job-message test groups additionally cover all six job formats, bounded
+variable data, attempt identity, and mixed streams; see [their coverage](job-protocol.md#verification).

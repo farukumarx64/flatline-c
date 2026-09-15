@@ -14,9 +14,10 @@ registers, validates its assigned ID, and sends periodic heartbeats. Worker inte
 and coordinator timeout are configurable, defaulting to two and six seconds.
 The [job model](jobs.md) defines records and validated state transitions, including
 attempt identity and bounded requeue/failure rules. The [FIFO queue](queue.md)
-holds pending IDs in insertion order independently of full job records. Job
-messages, the job store, scheduling, execution, automatic retries, and recovery
-have not been implemented yet.
+holds pending IDs in insertion order independently of full job records. The
+[job message codec](job-protocol.md) defines submission, acknowledgment, assignment,
+started, completed, and failed payloads. Runtime job transport/handlers, the job
+store, scheduling, execution, automatic retries, and recovery remain future work.
 
 ## Components and ownership
 
@@ -94,8 +95,9 @@ in [the protocol specification](protocol.md). PING/PONG, registration, and
 heartbeat handlers support partial headers and the fixed worker ID payload; see
 [the networking walkthrough](networking.md). The coordinator's
 [worker registry](workers.md) owns IDs independently of reusable socket descriptors.
-Variable-length job payloads will require extending the current bounded buffers
-and message representation.
+The shared message representation supports bounded variable job payloads.
+Runtime job handling will require extending the current 16-byte transport buffers
+and dispatch logic; recognized job headers are safely rejected for now.
 
 Before job execution and persistence are implemented, resolve how workers keep
 sending heartbeats during long computations, how job/attempt IDs and retry

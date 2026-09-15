@@ -33,13 +33,14 @@ A source buffer must not overlap the destination job record.
 
 This is an initial bounded representation for the MVP, separate from the generic
 protocol header's 1 MiB payload ceiling. Task-specific argument/result schemas
-and validation belong to the upcoming job messages and executors. The model checks
+and validation belong to the upcoming executors. The [job message codec](job-protocol.md)
+now encodes task IDs, bounded opaque data, and assignment/report identity. The model checks
 the known task type and byte limits, but does not interpret a sleep duration, hash
 input, or numeric computation limit yet.
 
 All numeric fields are host-order values. Neither this struct nor its arrays of
-metadata constitute a wire format or WAL record. Future serialization must encode
-fields explicitly. The worker ID is a logical ID, never a socket descriptor.
+metadata constitute a wire format or WAL record. Job messages encode selected
+fields explicitly; persistence serialization is still future work. The worker ID is a logical ID, never a socket descriptor.
 
 ## States and allowed transitions
 
@@ -142,8 +143,8 @@ completion for job 42, worker 7, attempt 2 -> accepted
 Checking the worker ID alone would accept the wrong report in this example.
 Attempt numbers distinguish repeated assignments even to the same worker. They
 use 64 bits so the largest 32-bit retry allowance plus the initial attempt fits.
-Future messages must carry the attempt along with job identity, and their handler
-must validate the sending connection before calling these operations.
+The defined job messages carry the attempt along with job and worker identity.
+Their future handlers must validate the sending connection before calling these operations.
 
 These are record transitions only. Calling fail does not insert anything into
 a FIFO, send another assignment, or run another task. An explicit successful

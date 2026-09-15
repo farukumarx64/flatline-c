@@ -24,8 +24,11 @@ An in-memory job model now defines task types, owned arguments/results, states,
 worker assignments, attempt numbers, timestamps, and bounded retry transitions.
 Its operations reject invalid transitions and stale reports. A coordinator FIFO
 module now holds up to 256 pending job IDs, preserves insertion order, and rejects
-duplicates or overflow. Jobs are not yet submitted or executed by the running
-programs; job messages, the job store, and scheduling will connect these pieces.
+duplicates or overflow. The shared protocol codec now encodes and validates job
+submission, acknowledgment, assignment, started, completed, and failed messages,
+including bounded arguments/results and attempt identity. Jobs are not yet
+submitted or executed by the running programs; transport handlers, the job store,
+and scheduling will connect these pieces.
 
 ## Build and run
 
@@ -143,6 +146,7 @@ faultline/
 ├── docs/
 │   ├── architecture.md
 │   ├── protocol.md
+│   ├── job-protocol.md
 │   ├── networking.md
 │   ├── workers.md
 │   ├── jobs.md
@@ -165,4 +169,6 @@ The [worker guide](docs/workers.md) describes the registration exchange, worker
 IDs, connection ownership, and heartbeat timing. The [job guide](docs/jobs.md)
 defines the record, state transitions, attempt identity, and retry limits.
 The [queue guide](docs/queue.md) explains FIFO ordering, capacity, and job ownership.
-Next come job messages, submission/storage, and assignment to available workers.
+The [job message specification](docs/job-protocol.md) defines payload offsets,
+message semantics, and validation. Next come submission/storage handlers and
+assignment to available workers.

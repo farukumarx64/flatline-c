@@ -49,6 +49,28 @@ test, source line, and expression. Its checks remain active with `NDEBUG` set.
   checking byte-consumption counts and decoding again as the remaining ID bytes
   arrive. This is a buffer-level test, not a live worker registration exchange.
 
+`test_job_messages.c` adds eight job codec test groups:
+
+- Literal complete frames for all six job types, including unaligned 64-bit
+  fields, exact lengths, and untouched surrounding bytes.
+- Every incomplete prefix and insufficient capacity for each sample frame and
+  the maximum 1062-byte assignment; exact allocations expose overreads to ASan.
+- Empty, 1/255/256/1024-byte binary data, embedded zeroes, decoded ownership after
+  receive-buffer reuse, and rejection of 1025-byte/`SIZE_MAX` host lengths.
+- All task IDs, retry limits zero/`UINT32_MAX`, job/worker ID boundaries, and
+  64-bit attempts above `UINT32_MAX` through `UINT64_MAX`.
+- Zero identity fields, unknown tasks, and invalid failure codes, including a
+  worker trying to report the coordinator-only WORKER_LOST reason.
+- Too-short/too-large outer sizes and inconsistent or oversized inner lengths,
+  rejected from the available prefix without waiting for data.
+- Coalesced job messages and a heartbeat followed by a fragmented final report.
+- A decoded STARTED report accepted by the model, then rejected as stale after
+  reassignment to the same worker under a newer attempt number.
+
+Rejected codec calls preserve all output bytes and written/consumed counts.
+These are buffer/model tests; live job execution is not implemented. The new
+binary also links the job model for the final identity check.
+
 `test_net.c` has six socket test groups and two parsing groups. Socket
 tests use local stream socket pairs and child processes to verify fragmented
 receives, clean EOF versus truncation,
@@ -96,7 +118,7 @@ Stale IDs cannot update or kill its replacement worker. Churn exceeds the
 
 These tests need no sockets or sleeps. They verify model-level transitions only;
 there is no job submission, executor, or automatic retry in the running
-programs yet. The job model links into the coordinator and the job/queue test
+programs yet. The job model links into the coordinator and the job/queue/job-message test
 binaries; the CLI and worker do not link its transition implementation.
 
 `test_job_queue.c` adds seven FIFO test groups:
@@ -136,6 +158,11 @@ all 15 two-part heartbeat splits, registration plus a coalesced PING and half-cl
 duplicate registration, truncated/invalid worker frames, and an idle registered
 worker alongside a stalled payload. The stalled payload times out and marks its
 worker dead; the idle worker expires under the default six-second heartbeat timeout.
+
+One additional scenario sends all six valid job header types and the largest
+variable declarations while keeping each peer open. The current 16-byte runtime
+receiver must reject them before reading payload data; another registered worker
+must continue heartbeating and PING/PONG must remain usable.
 Logs verify state transitions and timestamp updates, including that PING
 and incomplete heartbeat bytes do not count as heartbeats. Positional log reads
 avoid moving the file offset shared with the coordinator's output stream.

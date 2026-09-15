@@ -3,8 +3,9 @@
 The FIFO module is defined in `include/job_queue.h` and implemented in
 `src/coordinator/job_queue.c`. It stores up to 256 pending job IDs in successful
 insertion order. It is linked into the coordinator and tested with the
-[job model](jobs.md). CLI submission, job messages, the authoritative job store,
-and the scheduler are still needed to use it in the running system.
+[job model](jobs.md). The [job message formats](job-protocol.md) are now defined.
+CLI submission and transport handlers, the authoritative job store, and the
+scheduler are still needed to use the queue in the running system.
 
 ## What FIFO means
 
