@@ -75,7 +75,9 @@ static void queue_reply(struct client *client,
                          struct faultline_worker_registry *registry,
                          uint16_t message_type, uint32_t worker_id)
 {
-    const struct faultline_message reply = {message_type, worker_id};
+    const struct faultline_message reply = {
+        .message_type = message_type, .payload.worker_id = worker_id
+    };
 
     if (faultline_message_encode(client->output, sizeof(client->output), &reply,
                                  &client->output_size) != FAULTLINE_PROTOCOL_OK) {
@@ -114,11 +116,11 @@ static void handle_message(struct client *client,
         break;
     case FAULTLINE_MSG_HEARTBEAT:
         if (client->worker_id == FAULTLINE_WORKER_ID_UNASSIGNED ||
-            message->worker_id != client->worker_id) {
+            message->payload.worker_id != client->worker_id) {
             close_client(client, registry, "heartbeat_identity_mismatch");
             return;
         }
-        result = faultline_worker_heartbeat(registry, message->worker_id, client->fd, now);
+        result = faultline_worker_heartbeat(registry, message->payload.worker_id, client->fd, now);
         if (result != FAULTLINE_REGISTRY_OK) {
             close_client(client, registry, "heartbeat_rejected");
             return;

@@ -140,7 +140,7 @@ class WorkerExecutableTests(WorkerProcessTestCase):
             ack[:4] + b'\x00\x02' + ack[6:12],
             test_ping.PONG,
             test_ping.HEARTBEAT_HEADER,
-            ack[:6] + b'\x00\x06' + ack[8:12],
+            ack[:6] + b'\x00\x0c' + ack[8:12],
             *(ack[:8] + struct.pack('!I', size) for size in (0, 3, 5, 1048577)),
             test_ping.REGISTER_ACK_HEADER + struct.pack('!I', 0),
         ]

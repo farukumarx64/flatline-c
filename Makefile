@@ -24,7 +24,7 @@ JOB_OBJECT := $(BUILD_DIR)/coordinator/job.o
 QUEUE_OBJECT := $(BUILD_DIR)/coordinator/job_queue.o
 MAIN_OBJECTS := $(BUILD_DIR)/coordinator/main.o \
 	$(BUILD_DIR)/worker/main.o $(BUILD_DIR)/cli/main.o
-TEST_NAMES := test_protocol test_messages test_net test_worker_registry test_jobs test_job_queue
+TEST_NAMES := test_protocol test_messages test_net test_worker_registry test_jobs test_job_queue test_job_messages
 TEST_OBJECTS := $(addprefix $(BUILD_DIR)/tests/,$(addsuffix .o,$(TEST_NAMES)))
 OBJECTS := $(COMMON_OBJECTS) $(MAIN_OBJECTS) $(TEST_OBJECTS) $(REGISTRY_OBJECT) $(JOB_OBJECT) $(QUEUE_OBJECT)
 PROGRAMS := $(BUILD_DIR)/faultline-coordinator \
@@ -47,6 +47,7 @@ test-unit: $(TEST_PROGRAMS)
 	./$(BUILD_DIR)/tests/test_worker_registry
 	./$(BUILD_DIR)/tests/test_jobs
 	./$(BUILD_DIR)/tests/test_job_queue
+	./$(BUILD_DIR)/tests/test_job_messages
 
 test-integration: all test-failures
 	$(PYTHON) tests/integration/test_ping.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
@@ -73,7 +74,7 @@ $(TEST_PROGRAMS): $(BUILD_DIR)/tests/%: $(BUILD_DIR)/tests/%.o $(COMMON_OBJECTS)
 
 $(BUILD_DIR)/tests/test_worker_registry: $(REGISTRY_OBJECT)
 
-$(BUILD_DIR)/tests/test_jobs: $(JOB_OBJECT)
+$(BUILD_DIR)/tests/test_jobs $(BUILD_DIR)/tests/test_job_messages: $(JOB_OBJECT)
 
 $(BUILD_DIR)/tests/test_job_queue: $(JOB_OBJECT) $(QUEUE_OBJECT)
 

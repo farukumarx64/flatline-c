@@ -129,13 +129,15 @@ static int receive_registration_ack(int fd, uint32_t *worker_id)
         fputs("worker: invalid registration ACK payload\n", stderr);
         return -1;
     }
-    *worker_id = message.worker_id;
+    *worker_id = message.payload.worker_id;
     return 0;
 }
 
 static int run_heartbeats(int fd, uint32_t worker_id, int interval_ms)
 {
-    const struct faultline_message heartbeat = {FAULTLINE_MSG_HEARTBEAT, worker_id};
+    const struct faultline_message heartbeat = {
+        .message_type = FAULTLINE_MSG_HEARTBEAT, .payload.worker_id = worker_id
+    };
     uint8_t wire[FAULTLINE_HEADER_SIZE + FAULTLINE_HEARTBEAT_PAYLOAD_SIZE];
     size_t written;
     int64_t now = faultline_monotonic_ms();
@@ -187,7 +189,7 @@ static int run_heartbeats(int fd, uint32_t worker_id, int interval_ms)
         } else if (count == 0) {
             fputs("worker: coordinator disconnected\n", stderr);
         } else {
-            /* Job messages are not implemented yet; do not silently discard data. */
+            /* Job handlers are not implemented yet; do not silently discard data. */
             fputs("worker: unexpected data after registration\n", stderr);
         }
         return EXIT_FAILURE;
@@ -203,7 +205,9 @@ int main(int argc, char **argv)
     int endpoint_seen = 0;
     int interval_seen = 0;
     uint32_t worker_id = FAULTLINE_WORKER_ID_UNASSIGNED;
-    const struct faultline_message registration = {FAULTLINE_MSG_WORKER_REGISTER, 0};
+    const struct faultline_message registration = {
+        .message_type = FAULTLINE_MSG_WORKER_REGISTER, .payload.worker_id = 0
+    };
     uint8_t wire[FAULTLINE_HEADER_SIZE];
     size_t written;
     struct sigaction action = {0};

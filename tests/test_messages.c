@@ -19,16 +19,16 @@ static const struct {
     size_t size;
     uint8_t wire[16];
 } examples[] = {
-    {{FAULTLINE_MSG_PING, 0}, 12,
+    {{.message_type = FAULTLINE_MSG_PING, .payload.worker_id = 0}, 12,
      {0x46, 0x4c, 0x49, 0x4e, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 0}},
-    {{FAULTLINE_MSG_PONG, 0}, 12,
+    {{.message_type = FAULTLINE_MSG_PONG, .payload.worker_id = 0}, 12,
      {0x46, 0x4c, 0x49, 0x4e, 0x00, 0x01, 0x00, 0x02, 0, 0, 0, 0}},
-    {{FAULTLINE_MSG_WORKER_REGISTER, 0}, 12,
+    {{.message_type = FAULTLINE_MSG_WORKER_REGISTER, .payload.worker_id = 0}, 12,
      {0x46, 0x4c, 0x49, 0x4e, 0x00, 0x01, 0x00, 0x03, 0, 0, 0, 0}},
-    {{FAULTLINE_MSG_WORKER_REGISTER_ACK, UINT32_C(0x01020304)}, 16,
+    {{.message_type = FAULTLINE_MSG_WORKER_REGISTER_ACK, .payload.worker_id = UINT32_C(0x01020304)}, 16,
      {0x46, 0x4c, 0x49, 0x4e, 0x00, 0x01, 0x00, 0x04, 0, 0, 0, 4,
       0x01, 0x02, 0x03, 0x04}},
-    {{FAULTLINE_MSG_HEARTBEAT, UINT32_C(0x01020304)}, 16,
+    {{.message_type = FAULTLINE_MSG_HEARTBEAT, .payload.worker_id = UINT32_C(0x01020304)}, 16,
      {0x46, 0x4c, 0x49, 0x4e, 0x00, 0x01, 0x00, 0x05, 0, 0, 0, 4,
       0x01, 0x02, 0x03, 0x04}}
 };
@@ -37,7 +37,7 @@ static int messages_equal(const struct faultline_message *left,
                           const struct faultline_message *right)
 {
     return left->message_type == right->message_type &&
-           left->worker_id == right->worker_id;
+           left->payload.worker_id == right->payload.worker_id;
 }
 
 static int test_known_frames(void)
@@ -85,7 +85,7 @@ static int test_worker_id_boundaries(void)
 
     for (size_t type = 0; type < sizeof(types) / sizeof(types[0]); ++type) {
         for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); ++i) {
-            const struct faultline_message message = {types[type], ids[i].id};
+            const struct faultline_message message = {.message_type = types[type], .payload.worker_id = ids[i].id};
             struct faultline_message decoded = {0};
             uint8_t wire[16];
             size_t size = 0;
@@ -104,7 +104,7 @@ static int test_worker_id_boundaries(void)
 
 static int test_incomplete_frames(void)
 {
-    const struct faultline_message sentinel = {FAULTLINE_MSG_HEARTBEAT, 99};
+    const struct faultline_message sentinel = {.message_type = FAULTLINE_MSG_HEARTBEAT, .payload.worker_id = 99};
     uint8_t original[16];
 
     memset(original, 0xa5, sizeof(original));
@@ -138,7 +138,7 @@ static int test_incomplete_frames(void)
 
 static int test_invalid_frames(void)
 {
-    const struct faultline_message sentinel = {FAULTLINE_MSG_PONG, 0};
+    const struct faultline_message sentinel = {.message_type = FAULTLINE_MSG_PONG, .payload.worker_id = 0};
     const struct {
         uint32_t length;
         uint8_t bytes[4];
@@ -154,7 +154,7 @@ static int test_invalid_frames(void)
     } bad_headers[] = {
         {0, 0, FAULTLINE_PROTOCOL_BAD_MAGIC},
         {5, 2, FAULTLINE_PROTOCOL_UNSUPPORTED_VERSION},
-        {7, 6, FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE}
+        {7, 12, FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE}
     };
     struct faultline_message decoded = sentinel;
     size_t consumed = 99;
@@ -175,7 +175,7 @@ static int test_invalid_frames(void)
             CHECK(messages_equal(&decoded, &sentinel));
             CHECK(consumed == 99);
         }
-        if (examples[i].message.worker_id != 0) {
+        if (examples[i].message.payload.worker_id != 0) {
             memcpy(wire, examples[i].wire, sizeof(wire));
             memset(wire + 12, 0, 4);
             CHECK(faultline_message_decode(wire, sizeof(wire), &decoded, &consumed) ==
@@ -201,13 +201,13 @@ static int test_invalid_message_encode(void)
         struct faultline_message message;
         enum faultline_protocol_result result;
     } cases[] = {
-        {{0, 0}, FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE},
-        {{UINT16_MAX, 0}, FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE},
-        {{FAULTLINE_MSG_PING, 1}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID},
-        {{FAULTLINE_MSG_PONG, 1}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID},
-        {{FAULTLINE_MSG_WORKER_REGISTER, 1}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID},
-        {{FAULTLINE_MSG_WORKER_REGISTER_ACK, 0}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID},
-        {{FAULTLINE_MSG_HEARTBEAT, 0}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID}
+        {{.message_type = 0, .payload.worker_id = 0}, FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE},
+        {{.message_type = UINT16_MAX, .payload.worker_id = 0}, FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE},
+        {{.message_type = FAULTLINE_MSG_PING, .payload.worker_id = 1}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID},
+        {{.message_type = FAULTLINE_MSG_PONG, .payload.worker_id = 1}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID},
+        {{.message_type = FAULTLINE_MSG_WORKER_REGISTER, .payload.worker_id = 1}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID},
+        {{.message_type = FAULTLINE_MSG_WORKER_REGISTER_ACK, .payload.worker_id = 0}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID},
+        {{.message_type = FAULTLINE_MSG_HEARTBEAT, .payload.worker_id = 0}, FAULTLINE_PROTOCOL_INVALID_WORKER_ID}
     };
     uint8_t original[16];
 

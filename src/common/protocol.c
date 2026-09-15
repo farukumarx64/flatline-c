@@ -1,5 +1,11 @@
 #include "protocol.h"
 
+#include <string.h>
+
+_Static_assert(FAULTLINE_HEADER_SIZE + FAULTLINE_JOB_COMPLETED_PREFIX_SIZE +
+               FAULTLINE_JOB_MAX_RESULT_SIZE <= FAULTLINE_MESSAGE_MAX_FRAME_SIZE,
+               "maximum frame size must also fit completed results");
+
 static void write_u16_be(uint8_t *out, uint16_t value)
 {
     out[0] = (uint8_t)(value >> 8);
@@ -25,33 +31,64 @@ static uint32_t read_u32_be(const uint8_t *in)
            ((uint32_t)in[2] << 8) | (uint32_t)in[3];
 }
 
-static enum faultline_protocol_result message_payload_size(
-    uint16_t message_type, uint32_t *payload_size)
+static void write_u64_be(uint8_t *out, uint64_t value)
 {
+    write_u32_be(out, (uint32_t)(value >> 32));
+    write_u32_be(out + 4, (uint32_t)value);
+}
+
+static uint64_t read_u64_be(const uint8_t *in)
+{
+    return ((uint64_t)read_u32_be(in) << 32) | (uint64_t)read_u32_be(in + 4);
+}
+
+static enum faultline_protocol_result message_payload_bounds(
+    uint16_t message_type, uint32_t *minimum, uint32_t *maximum)
+{
+    uint32_t extra = 0;
+
     switch (message_type) {
     case FAULTLINE_MSG_PING:
     case FAULTLINE_MSG_PONG:
-        *payload_size = 0;
-        break;
     case FAULTLINE_MSG_WORKER_REGISTER:
-        *payload_size = FAULTLINE_WORKER_REGISTER_PAYLOAD_SIZE;
+        *minimum = 0;
         break;
     case FAULTLINE_MSG_WORKER_REGISTER_ACK:
-        *payload_size = FAULTLINE_WORKER_REGISTER_ACK_PAYLOAD_SIZE;
-        break;
     case FAULTLINE_MSG_HEARTBEAT:
-        *payload_size = FAULTLINE_HEARTBEAT_PAYLOAD_SIZE;
+        *minimum = 4;
+        break;
+    case FAULTLINE_MSG_JOB_SUBMIT:
+        *minimum = FAULTLINE_JOB_SUBMIT_PREFIX_SIZE;
+        extra = FAULTLINE_JOB_MAX_ARGUMENT_SIZE;
+        break;
+    case FAULTLINE_MSG_JOB_SUBMIT_ACK:
+        *minimum = FAULTLINE_JOB_SUBMIT_ACK_PAYLOAD_SIZE;
+        break;
+    case FAULTLINE_MSG_JOB_ASSIGN:
+        *minimum = FAULTLINE_JOB_ASSIGN_PREFIX_SIZE;
+        extra = FAULTLINE_JOB_MAX_ARGUMENT_SIZE;
+        break;
+    case FAULTLINE_MSG_JOB_STARTED:
+        *minimum = FAULTLINE_JOB_STARTED_PAYLOAD_SIZE;
+        break;
+    case FAULTLINE_MSG_JOB_COMPLETED:
+        *minimum = FAULTLINE_JOB_COMPLETED_PREFIX_SIZE;
+        extra = FAULTLINE_JOB_MAX_RESULT_SIZE;
+        break;
+    case FAULTLINE_MSG_JOB_FAILED:
+        *minimum = FAULTLINE_JOB_FAILED_PAYLOAD_SIZE;
         break;
     default:
         return FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE;
     }
+    *maximum = *minimum + extra;
     return FAULTLINE_PROTOCOL_OK;
 }
 
 static enum faultline_protocol_result validate_header(
     const struct faultline_header *header)
 {
-    uint32_t payload_size;
+    uint32_t minimum, maximum;
 
     if (header->magic != FAULTLINE_PROTOCOL_MAGIC) {
         return FAULTLINE_PROTOCOL_BAD_MAGIC;
@@ -59,7 +96,7 @@ static enum faultline_protocol_result validate_header(
     if (header->version != FAULTLINE_PROTOCOL_VERSION) {
         return FAULTLINE_PROTOCOL_UNSUPPORTED_VERSION;
     }
-    if (message_payload_size(header->message_type, &payload_size) !=
+    if (message_payload_bounds(header->message_type, &minimum, &maximum) !=
         FAULTLINE_PROTOCOL_OK) {
         return FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE;
     }
@@ -121,15 +158,114 @@ enum faultline_protocol_result faultline_header_decode(
     return FAULTLINE_PROTOCOL_OK;
 }
 
-static enum faultline_protocol_result validate_worker_id(
-    uint32_t payload_size, uint32_t worker_id)
+static int valid_task(uint16_t task_type)
 {
-    /* Empty messages have no ID; both current nonempty payloads require one. */
-    if ((payload_size == 0 && worker_id != FAULTLINE_WORKER_ID_UNASSIGNED) ||
-        (payload_size != 0 && worker_id == FAULTLINE_WORKER_ID_UNASSIGNED)) {
+    return task_type == FAULTLINE_TASK_SLEEP || task_type == FAULTLINE_TASK_PRIME_COUNT ||
+           task_type == FAULTLINE_TASK_FIBONACCI || task_type == FAULTLINE_TASK_HASH;
+}
+
+static enum faultline_protocol_result validate_identity(
+    const struct faultline_job_identity *identity)
+{
+    if (identity->job_id == 0) {
+        return FAULTLINE_PROTOCOL_INVALID_JOB_ID;
+    }
+    if (identity->worker_id == FAULTLINE_WORKER_ID_UNASSIGNED) {
         return FAULTLINE_PROTOCOL_INVALID_WORKER_ID;
     }
+    if (identity->attempt == 0) {
+        return FAULTLINE_PROTOCOL_INVALID_ATTEMPT;
+    }
     return FAULTLINE_PROTOCOL_OK;
+}
+
+/* Validate host values and derive the exact length before touching output bytes. */
+static enum faultline_protocol_result validate_message(
+    const struct faultline_message *message, uint32_t *payload_size)
+{
+    const struct faultline_job_identity *identity = NULL;
+    uint32_t minimum, maximum;
+    size_t data_size = 0;
+    enum faultline_protocol_result result =
+        message_payload_bounds(message->message_type, &minimum, &maximum);
+
+    if (result != FAULTLINE_PROTOCOL_OK) {
+        return result;
+    }
+    switch (message->message_type) {
+    case FAULTLINE_MSG_PING:
+    case FAULTLINE_MSG_PONG:
+    case FAULTLINE_MSG_WORKER_REGISTER:
+        if (message->payload.worker_id != 0) {
+            return FAULTLINE_PROTOCOL_INVALID_WORKER_ID;
+        }
+        break;
+    case FAULTLINE_MSG_WORKER_REGISTER_ACK:
+    case FAULTLINE_MSG_HEARTBEAT:
+        if (message->payload.worker_id == 0) {
+            return FAULTLINE_PROTOCOL_INVALID_WORKER_ID;
+        }
+        break;
+    case FAULTLINE_MSG_JOB_SUBMIT:
+        if (!valid_task(message->payload.job_submit.task_type)) {
+            return FAULTLINE_PROTOCOL_INVALID_TASK_TYPE;
+        }
+        data_size = message->payload.job_submit.argument_size;
+        break;
+    case FAULTLINE_MSG_JOB_SUBMIT_ACK:
+        if (message->payload.job_submit_ack == 0) {
+            return FAULTLINE_PROTOCOL_INVALID_JOB_ID;
+        }
+        break;
+    case FAULTLINE_MSG_JOB_ASSIGN:
+        identity = &message->payload.job_assign.identity;
+        if (!valid_task(message->payload.job_assign.task_type)) {
+            return FAULTLINE_PROTOCOL_INVALID_TASK_TYPE;
+        }
+        data_size = message->payload.job_assign.argument_size;
+        break;
+    case FAULTLINE_MSG_JOB_STARTED:
+        identity = &message->payload.job_started;
+        break;
+    case FAULTLINE_MSG_JOB_COMPLETED:
+        identity = &message->payload.job_completed.identity;
+        data_size = message->payload.job_completed.result_size;
+        break;
+    case FAULTLINE_MSG_JOB_FAILED:
+        identity = &message->payload.job_failed.identity;
+        if (message->payload.job_failed.failure != FAULTLINE_JOB_FAILURE_TASK) {
+            return FAULTLINE_PROTOCOL_INVALID_FAILURE;
+        }
+        break;
+    default:
+        return FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE;
+    }
+    if (identity != NULL) {
+        result = validate_identity(identity);
+        if (result != FAULTLINE_PROTOCOL_OK) {
+            return result;
+        }
+    }
+    /* Bound size_t before narrowing it or adding prefix bytes (including SIZE_MAX). */
+    if (data_size > (size_t)(maximum - minimum)) {
+        return FAULTLINE_PROTOCOL_PAYLOAD_TOO_LARGE;
+    }
+    *payload_size = minimum + (uint32_t)data_size;
+    return FAULTLINE_PROTOCOL_OK;
+}
+
+static void write_identity(uint8_t *out, const struct faultline_job_identity *identity)
+{
+    write_u64_be(out, identity->job_id);
+    write_u32_be(out + 8, identity->worker_id);
+    write_u64_be(out + 12, identity->attempt);
+}
+
+static void read_identity(const uint8_t *in, struct faultline_job_identity *identity)
+{
+    identity->job_id = read_u64_be(in);
+    identity->worker_id = read_u32_be(in + 8);
+    identity->attempt = read_u64_be(in + 12);
 }
 
 enum faultline_protocol_result faultline_message_encode(
@@ -142,16 +278,13 @@ enum faultline_protocol_result faultline_message_encode(
     };
     enum faultline_protocol_result result;
     size_t frame_size;
+    uint8_t *payload;
 
     if (wire == NULL || message == NULL || written == NULL) {
         return FAULTLINE_PROTOCOL_INVALID_ARGUMENT;
     }
     header.message_type = message->message_type;
-    result = message_payload_size(message->message_type, &header.payload_length);
-    if (result != FAULTLINE_PROTOCOL_OK) {
-        return result;
-    }
-    result = validate_worker_id(header.payload_length, message->worker_id);
+    result = validate_message(message, &header.payload_length);
     if (result != FAULTLINE_PROTOCOL_OK) {
         return result;
     }
@@ -159,14 +292,52 @@ enum faultline_protocol_result faultline_message_encode(
     if (wire_size < frame_size) {
         return FAULTLINE_PROTOCOL_BUFFER_TOO_SMALL;
     }
-
-    /* Validate everything before writing either the header or the payload. */
     result = faultline_header_encode(wire, wire_size, &header);
     if (result != FAULTLINE_PROTOCOL_OK) {
         return result;
     }
-    if (header.payload_length != 0) {
-        write_u32_be(wire + FAULTLINE_HEADER_SIZE, message->worker_id);
+
+    payload = wire + FAULTLINE_HEADER_SIZE;
+    switch (message->message_type) {
+    case FAULTLINE_MSG_WORKER_REGISTER_ACK:
+    case FAULTLINE_MSG_HEARTBEAT:
+        write_u32_be(payload, message->payload.worker_id);
+        break;
+    case FAULTLINE_MSG_JOB_SUBMIT: {
+        const struct faultline_job_submit_payload *submit = &message->payload.job_submit;
+        write_u16_be(payload, submit->task_type);
+        write_u32_be(payload + 2, submit->max_retries);
+        write_u32_be(payload + 6, (uint32_t)submit->argument_size);
+        memcpy(payload + 10, submit->arguments, submit->argument_size);
+        break;
+    }
+    case FAULTLINE_MSG_JOB_SUBMIT_ACK:
+        write_u64_be(payload, message->payload.job_submit_ack);
+        break;
+    case FAULTLINE_MSG_JOB_ASSIGN: {
+        const struct faultline_job_assign_payload *assign = &message->payload.job_assign;
+        write_identity(payload, &assign->identity);
+        write_u16_be(payload + 20, assign->task_type);
+        write_u32_be(payload + 22, (uint32_t)assign->argument_size);
+        memcpy(payload + 26, assign->arguments, assign->argument_size);
+        break;
+    }
+    case FAULTLINE_MSG_JOB_STARTED:
+        write_identity(payload, &message->payload.job_started);
+        break;
+    case FAULTLINE_MSG_JOB_COMPLETED: {
+        const struct faultline_job_completed_payload *completed = &message->payload.job_completed;
+        write_identity(payload, &completed->identity);
+        write_u32_be(payload + 20, (uint32_t)completed->result_size);
+        memcpy(payload + 24, completed->result, completed->result_size);
+        break;
+    }
+    case FAULTLINE_MSG_JOB_FAILED:
+        write_identity(payload, &message->payload.job_failed.identity);
+        write_u16_be(payload + 20, message->payload.job_failed.failure);
+        break;
+    default: /* Validated empty messages have nothing to write. */
+        break;
     }
     *written = frame_size;
     return FAULTLINE_PROTOCOL_OK;
@@ -179,8 +350,10 @@ enum faultline_protocol_result faultline_message_decode(
     struct faultline_header header;
     struct faultline_message decoded = {0};
     enum faultline_protocol_result result;
-    uint32_t payload_size;
+    uint32_t minimum, maximum, expected_size;
     size_t frame_size;
+    const uint8_t *payload;
+    uint8_t *data = NULL;
 
     if (wire == NULL || message == NULL || consumed == NULL) {
         return FAULTLINE_PROTOCOL_INVALID_ARGUMENT;
@@ -189,26 +362,73 @@ enum faultline_protocol_result faultline_message_decode(
     if (result != FAULTLINE_PROTOCOL_OK) {
         return result;
     }
-    result = message_payload_size(header.message_type, &payload_size);
+    result = message_payload_bounds(header.message_type, &minimum, &maximum);
     if (result != FAULTLINE_PROTOCOL_OK) {
         return result;
     }
-    if (header.payload_length != payload_size) {
+    if (header.payload_length < minimum ||
+        (minimum == maximum && header.payload_length != minimum)) {
         return FAULTLINE_PROTOCOL_INVALID_PAYLOAD_LENGTH;
     }
-    frame_size = FAULTLINE_HEADER_SIZE + (size_t)payload_size;
+    if (header.payload_length > maximum) {
+        return FAULTLINE_PROTOCOL_PAYLOAD_TOO_LARGE;
+    }
+    if (wire_size < FAULTLINE_HEADER_SIZE + (size_t)minimum) {
+        return FAULTLINE_PROTOCOL_BUFFER_TOO_SMALL;
+    }
+
+    /* The whole fixed prefix is present. Do not read variable data yet. */
+    payload = wire + FAULTLINE_HEADER_SIZE;
+    decoded.message_type = header.message_type;
+    switch (header.message_type) {
+    case FAULTLINE_MSG_WORKER_REGISTER_ACK:
+    case FAULTLINE_MSG_HEARTBEAT:
+        decoded.payload.worker_id = read_u32_be(payload);
+        break;
+    case FAULTLINE_MSG_JOB_SUBMIT:
+        decoded.payload.job_submit.task_type = read_u16_be(payload);
+        decoded.payload.job_submit.max_retries = read_u32_be(payload + 2);
+        decoded.payload.job_submit.argument_size = read_u32_be(payload + 6);
+        data = decoded.payload.job_submit.arguments;
+        break;
+    case FAULTLINE_MSG_JOB_SUBMIT_ACK:
+        decoded.payload.job_submit_ack = read_u64_be(payload);
+        break;
+    case FAULTLINE_MSG_JOB_ASSIGN:
+        read_identity(payload, &decoded.payload.job_assign.identity);
+        decoded.payload.job_assign.task_type = read_u16_be(payload + 20);
+        decoded.payload.job_assign.argument_size = read_u32_be(payload + 22);
+        data = decoded.payload.job_assign.arguments;
+        break;
+    case FAULTLINE_MSG_JOB_STARTED:
+        read_identity(payload, &decoded.payload.job_started);
+        break;
+    case FAULTLINE_MSG_JOB_COMPLETED:
+        read_identity(payload, &decoded.payload.job_completed.identity);
+        decoded.payload.job_completed.result_size = read_u32_be(payload + 20);
+        data = decoded.payload.job_completed.result;
+        break;
+    case FAULTLINE_MSG_JOB_FAILED:
+        read_identity(payload, &decoded.payload.job_failed.identity);
+        decoded.payload.job_failed.failure = read_u16_be(payload + 20);
+        break;
+    default: /* Validated empty messages keep worker_id zero. */
+        break;
+    }
+    result = validate_message(&decoded, &expected_size);
+    if (result != FAULTLINE_PROTOCOL_OK) {
+        return result;
+    }
+    if (header.payload_length != expected_size) {
+        return FAULTLINE_PROTOCOL_INVALID_PAYLOAD_LENGTH;
+    }
+    frame_size = FAULTLINE_HEADER_SIZE + (size_t)expected_size;
     if (wire_size < frame_size) {
         return FAULTLINE_PROTOCOL_BUFFER_TOO_SMALL;
     }
-    decoded.message_type = header.message_type;
-    if (payload_size != 0) {
-        decoded.worker_id = read_u32_be(wire + FAULTLINE_HEADER_SIZE);
+    if (data != NULL) {
+        memcpy(data, payload + minimum, (size_t)(expected_size - minimum));
     }
-    result = validate_worker_id(payload_size, decoded.worker_id);
-    if (result != FAULTLINE_PROTOCOL_OK) {
-        return result;
-    }
-
     *message = decoded;
     *consumed = frame_size;
     return FAULTLINE_PROTOCOL_OK;

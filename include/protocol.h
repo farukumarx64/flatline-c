@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "job.h"
+
 /* Wire bytes 46 4c 49 4e spell "FLIN" in ASCII. */
 #define FAULTLINE_PROTOCOL_MAGIC UINT32_C(0x464c494e)
 #define FAULTLINE_PROTOCOL_VERSION UINT16_C(1)
@@ -14,12 +16,28 @@
 #define FAULTLINE_HEARTBEAT_PAYLOAD_SIZE 4u
 #define FAULTLINE_WORKER_ID_UNASSIGNED UINT32_C(0)
 
+/* Prefix sizes exclude both the header and any argument/result bytes. */
+#define FAULTLINE_JOB_SUBMIT_PREFIX_SIZE 10u
+#define FAULTLINE_JOB_SUBMIT_ACK_PAYLOAD_SIZE 8u
+#define FAULTLINE_JOB_ASSIGN_PREFIX_SIZE 26u
+#define FAULTLINE_JOB_STARTED_PAYLOAD_SIZE 20u
+#define FAULTLINE_JOB_COMPLETED_PREFIX_SIZE 24u
+#define FAULTLINE_JOB_FAILED_PAYLOAD_SIZE 22u
+#define FAULTLINE_MESSAGE_MAX_FRAME_SIZE \
+    (FAULTLINE_HEADER_SIZE + FAULTLINE_JOB_ASSIGN_PREFIX_SIZE + FAULTLINE_JOB_MAX_ARGUMENT_SIZE)
+
 enum faultline_message_type {
     FAULTLINE_MSG_PING = 1,
     FAULTLINE_MSG_PONG = 2,
     FAULTLINE_MSG_WORKER_REGISTER = 3,
     FAULTLINE_MSG_WORKER_REGISTER_ACK = 4,
-    FAULTLINE_MSG_HEARTBEAT = 5
+    FAULTLINE_MSG_HEARTBEAT = 5,
+    FAULTLINE_MSG_JOB_SUBMIT = 6,
+    FAULTLINE_MSG_JOB_SUBMIT_ACK = 7,
+    FAULTLINE_MSG_JOB_ASSIGN = 8,
+    FAULTLINE_MSG_JOB_STARTED = 9,
+    FAULTLINE_MSG_JOB_COMPLETED = 10,
+    FAULTLINE_MSG_JOB_FAILED = 11
 };
 
 /* Host-order values only. Never send this struct directly over a socket. */
@@ -30,14 +48,55 @@ struct faultline_header {
     uint32_t payload_length;
 };
 
+/* All three values are nonzero. Validation of current ownership is up to handlers. */
+struct faultline_job_identity {
+    uint64_t job_id;
+    uint32_t worker_id;
+    uint64_t attempt;
+};
+
+struct faultline_job_submit_payload {
+    uint16_t task_type;
+    uint32_t max_retries;
+    size_t argument_size;
+    uint8_t arguments[FAULTLINE_JOB_MAX_ARGUMENT_SIZE];
+};
+
+struct faultline_job_assign_payload {
+    struct faultline_job_identity identity;
+    uint16_t task_type;
+    size_t argument_size;
+    uint8_t arguments[FAULTLINE_JOB_MAX_ARGUMENT_SIZE];
+};
+
+struct faultline_job_completed_payload {
+    struct faultline_job_identity identity;
+    size_t result_size;
+    uint8_t result[FAULTLINE_JOB_MAX_RESULT_SIZE];
+};
+
+struct faultline_job_failed_payload {
+    struct faultline_job_identity identity;
+    uint16_t failure; /* Only TASK is a worker report; WORKER_LOST is local. */
+};
+
 /*
- * Host-order representation of the currently supported complete messages.
- * worker_id is nonzero for WORKER_REGISTER_ACK and HEARTBEAT, and zero for
- * PING, PONG, and WORKER_REGISTER. Never send this struct directly.
+ * Host-order tagged union: initialize/read only the member named by message_type.
+ * Empty messages use payload.worker_id = 0; worker ACK/HEARTBEAT use a nonzero ID.
+ * Job byte arrays are owned copies, not strings or borrowed buffer pointers.
+ * Never send this struct directly. See docs/job-protocol.md for wire offsets.
  */
 struct faultline_message {
     uint16_t message_type;
-    uint32_t worker_id;
+    union {
+        uint32_t worker_id;
+        struct faultline_job_submit_payload job_submit;
+        uint64_t job_submit_ack; /* Successful acceptance: coordinator-issued job ID. */
+        struct faultline_job_assign_payload job_assign;
+        struct faultline_job_identity job_started;
+        struct faultline_job_completed_payload job_completed;
+        struct faultline_job_failed_payload job_failed;
+    } payload;
 };
 
 enum faultline_protocol_result {
@@ -49,7 +108,11 @@ enum faultline_protocol_result {
     FAULTLINE_PROTOCOL_UNKNOWN_MESSAGE_TYPE,
     FAULTLINE_PROTOCOL_PAYLOAD_TOO_LARGE,
     FAULTLINE_PROTOCOL_INVALID_PAYLOAD_LENGTH,
-    FAULTLINE_PROTOCOL_INVALID_WORKER_ID
+    FAULTLINE_PROTOCOL_INVALID_WORKER_ID,
+    FAULTLINE_PROTOCOL_INVALID_JOB_ID,
+    FAULTLINE_PROTOCOL_INVALID_ATTEMPT,
+    FAULTLINE_PROTOCOL_INVALID_TASK_TYPE,
+    FAULTLINE_PROTOCOL_INVALID_FAILURE
 };
 
 /*
@@ -83,9 +146,10 @@ enum faultline_protocol_result faultline_message_encode(
 
 /*
  * Decode one complete frame from wire_size available bytes. A partial header
- * or payload returns BUFFER_TOO_SMALL; a wrong declared length returns
- * INVALID_PAYLOAD_LENGTH. *consumed reports this frame's size on success, so
- * the caller can retain following frames. All output stays unchanged on error.
+ * or payload returns BUFFER_TOO_SMALL unless an available declaration is already
+ * invalid. Variable data is bounded and its length must match the outer header.
+ * On success, *consumed reports this frame's size so the caller can retain
+ * following frames. All output stays unchanged on error.
  * The same pointer/storage rules as message_encode apply.
  */
 enum faultline_protocol_result faultline_message_decode(

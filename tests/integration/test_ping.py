@@ -262,7 +262,7 @@ class CoordinatorTests(CoordinatorTestCase):
         requests = [
             b"NOPE" + PING[4:],
             PING[:4] + b"\x00\x02" + PING[6:],
-            PING[:6] + b"\x00\x06" + PING[8:],
+            PING[:6] + b"\x00\x0c" + PING[8:],
             PONG,
             PING[:8] + struct.pack("!I", 1),
             PING[:8] + struct.pack("!I", 1048577),
@@ -271,6 +271,21 @@ class CoordinatorTests(CoordinatorTestCase):
             with self.subTest(request=request.hex()), self.connect() as connection:
                 connection.sendall(request)
                 self.assert_closed(connection)
+        self.assert_pong(self.run_cli())
+
+    def test_job_headers_are_rejected_until_handlers_exist(self):
+        # The codec recognizes these formats; the live receiver still supports
+        # lifecycle messages only. Reject before reading into its 16-byte buffer.
+        with self.connect() as healthy:
+            worker_id = self.register_worker(healthy)
+            for message_type, length in ((6, 10), (7, 8), (8, 26), (9, 20),
+                                         (10, 24), (11, 22), (6, 1034),
+                                         (8, 1050), (10, 1048)):
+                with self.subTest(message_type=message_type, length=length), self.connect() as connection:
+                    connection.sendall(struct.pack("!IHHI", 0x464c494e, 1, message_type, length))
+                    self.assert_closed(connection)
+                self.send_heartbeat_and_ping(healthy, worker_id)
+            self.assertEqual(self.worker_events("worker_dead", worker_id), [])
         self.assert_pong(self.run_cli())
 
     def test_reset_during_reply_does_not_stop_server(self):

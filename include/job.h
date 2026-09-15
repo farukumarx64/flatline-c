@@ -4,16 +4,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Model limits, not wire-format declarations. Payloads are owned byte arrays. */
+/* Model byte limits are also enforced by the job message codec. */
 #define FAULTLINE_JOB_MAX_ARGUMENT_SIZE 1024u
 #define FAULTLINE_JOB_MAX_RESULT_SIZE 1024u
 #define FAULTLINE_JOB_TIME_UNSET INT64_C(-1)
 
 enum faultline_task_type {
     FAULTLINE_TASK_SLEEP = 1,
-    FAULTLINE_TASK_PRIME_COUNT,
-    FAULTLINE_TASK_FIBONACCI,
-    FAULTLINE_TASK_HASH
+    FAULTLINE_TASK_PRIME_COUNT = 2,
+    FAULTLINE_TASK_FIBONACCI = 3,
+    FAULTLINE_TASK_HASH = 4
 };
 
 enum faultline_job_state {
@@ -26,8 +26,8 @@ enum faultline_job_state {
 
 enum faultline_job_failure {
     FAULTLINE_JOB_FAILURE_NONE = 0,
-    FAULTLINE_JOB_FAILURE_TASK,
-    FAULTLINE_JOB_FAILURE_WORKER_LOST
+    FAULTLINE_JOB_FAILURE_TASK = 1,
+    FAULTLINE_JOB_FAILURE_WORKER_LOST = 2
 };
 
 /*
