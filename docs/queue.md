@@ -4,8 +4,8 @@ The FIFO module is defined in `include/job_queue.h` and implemented in
 `src/coordinator/job_queue.c`. It stores up to 256 pending job IDs in successful
 insertion order. It is linked into the coordinator and tested with the
 [job model](jobs.md). The [job message formats](job-protocol.md) are now defined.
-CLI submission and transport handlers, the authoritative job store, and the
-scheduler are still needed to use the queue in the running system.
+The [scheduler](scheduling.md) now owns the authoritative job store, accepts CLI
+submissions, and uses this queue for live assignments and retries.
 
 ## What FIFO means
 
@@ -27,7 +27,7 @@ selection order; workers may finish different jobs in a different order.
 ## Queue entries and job records
 
 The queue copies only the job's 64-bit ID. It never retains the supplied pointer
-or copies the argument/result arrays. The future job store must keep full records
+or copies the argument/result arrays. The scheduler's job store keeps full records
 separately and support lookup by ID, including jobs that have left the queue.
 
 For example, popping ID 42 removes its waiting-list entry. It does not destroy
@@ -61,11 +61,12 @@ ID unchanged. Caller-provided pointers must address valid, non-overlapping stora
 Initialization is for fresh or intentionally reset storage; reinitializing a
 nonempty queue discards its entries.
 
-The 256-entry limit applies to pending IDs, not the total number of jobs the
-future store can retain. A full push reports FULL and preserves all existing
-entries. It also leaves the proposed job record untouched. Future submission
-handlers must handle this result before acknowledging acceptance. Retry handling
-must retain or defer a job whose re-enqueue cannot succeed rather than drop it.
+The queue's 256-entry limit applies to pending IDs. The scheduler separately
+retains up to 256 total records, including active and terminal jobs. A full push
+reports FULL and preserves the queue and proposed record. Submission is
+acknowledged only after storage and enqueue succeed. Since every active job is
+absent from this queue and the store holds at most 256 jobs, a failed active job
+always has room to requeue. The scheduler enforces that capacity relationship.
 
 ## Circular-array implementation
 
@@ -95,8 +96,8 @@ uses 2048 bytes, plus the two position/count fields and any struct padding.
 
 ## Waiting and assignment
 
-When no worker is available, the scheduler should leave the queue unchanged.
-Repeated peeks do not consume work. Once a worker is available, the intended
+When no worker is available, the scheduler leaves the queue unchanged.
+Repeated peeks do not consume work. Once a worker is available, the
 single-event-loop sequence is:
 
 1. Peek the oldest ID.
@@ -109,7 +110,7 @@ If assignment fails, do not pop or push the front job again; doing that would
 remove work or move it behind newer jobs. Complete this sequence in one event-loop
 operation with no intervening queue mutations. Pop itself does not verify worker
 availability or change the job state. The scheduler and send-failure/retry paths
-are not implemented by this module.
+live in the separate scheduler and coordinator event-loop code.
 
 Likewise, `faultline_job_fail()` changing a record back to QUEUED does not insert
 it into this queue. A successful explicit push adds it to the back. A state value

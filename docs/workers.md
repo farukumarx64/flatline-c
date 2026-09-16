@@ -8,8 +8,10 @@ in `include/worker_registry.h`. The wire format is documented in
 
 The worker executable connects and registers, reads its assigned ID from
 the acknowledgment, and sends periodic heartbeats. The coordinator expires
-registrations that miss their heartbeat deadline. Scheduling and persistent
-recovery are not implemented yet. Integration tests cover both real workers
+registrations that miss their heartbeat deadline. The [scheduler](scheduling.md)
+now assigns queued jobs to idle workers and retries interrupted assignments.
+Workers retain one assignment while heartbeating; executors and persistent
+recovery remain future work. Integration tests cover both real workers
 and controlled peers.
 
 ## Run two workers
@@ -67,7 +69,8 @@ five-second budget.
 SIGINT/SIGTERM interrupt the ACK or heartbeat wait promptly; connect/send may finish
 their bounded operation first. A local stop exits successfully. Coordinator
 disconnection, invalid ACKs, or unexpected data after registration exit with
-failure. The worker does not yet process jobs or automatically reconnect.
+failure. Valid JOB_ASSIGN frames are now received and retained while heartbeats
+continue. Execution and automatic reconnect remain future work.
 Its retained ID applies only to this connection.
 
 ## Heartbeat interval and timeout
@@ -145,12 +148,14 @@ time 10s: six seconds since the last heartbeat; worker becomes DEAD
 
 Timeout closes that connection through the existing cleanup path: mark DEAD,
 detach the descriptor, and close the socket. Other workers and the CLI continue
-to run. A new connection must register and receives a fresh ID. There is no job
-requeue action yet because jobs and assignments have not been implemented.
+to run. A new connection must register and receives a fresh ID. The scheduler
+handles an active job through WORKER_LOST: requeue at the back when retries
+remain, or mark FAILED when they are exhausted.
 
 A timeout means the coordinator considers this registration unavailable. It does
 not prove the process crashed: a pause, network delay, or overloaded machine can
-produce the same observation. This distinction will matter when retrying jobs.
+produce the same observation. Attempt identity prevents a late report from
+updating a newer assignment; future executors must account for possible overlap.
 
 ## Verify failure detection
 

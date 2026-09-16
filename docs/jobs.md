@@ -4,13 +4,14 @@ The job model is defined in `include/job.h`, with coordinator-owned operations
 in `src/coordinator/job.c`. It describes one job and enforces changes to that
 record. A separate [FIFO queue](queue.md) now stores pending job IDs. The model
 does not allocate globally unique IDs, send job messages, execute tasks, or
-connect worker failure detection to retries.
+itself connect worker failure detection to retries. The [scheduler](scheduling.md)
+now orchestrates storage, enqueue, assignment, reports, and worker-loss transitions.
 
 ## What a job contains
 
 | Field | Purpose |
 | --- | --- |
-| `id` | Nonzero 64-bit job ID, supplied by the caller. The future coordinator job store must ensure uniqueness. |
+| `id` | Nonzero 64-bit job ID, supplied by the caller. The coordinator scheduler now allocates unique IDs within its lifetime. |
 | `task_type` | SLEEP, PRIME_COUNT, FIBONACCI, or HASH. These identify planned executors; none is implemented yet. |
 | `arguments`, `argument_size` | An owned copy of the task's opaque argument bytes and their length. |
 | `state` | QUEUED, ASSIGNED, RUNNING, DONE, or FAILED. |
@@ -71,8 +72,8 @@ the worker message flow must report STARTED before COMPLETED.
 
 There are no self-transitions. A duplicate STARTED or COMPLETED call fails without
 changing the record. DONE and FAILED cannot be reassigned, restarted, completed
-again, or requeued. Future network handlers will need an explicit policy for
-duplicate reports; these strict model operations do not silently accept them.
+again, or requeued. The coordinator closes connections that send
+invalid or duplicate reports; these strict model operations do not silently accept them.
 
 `faultline_job_can_transition()` checks only this state graph. It cannot decide
 whether a particular worker owns the job or whether retry budget remains. Use
@@ -99,8 +100,8 @@ transitions, reversed time, wrong workers, and stale attempts.
 The coordinator owns the record. Treat public fields as read-only outside the
 module, and call init only on fresh/reusable storage, never to overwrite a live
 job. This module allocates no memory, reads no clocks, and performs no I/O. Its
-caller supplies time and controls the record's lifetime. The future scheduler
-must also verify that a worker is alive and idle; a nonzero ID alone does not
+caller supplies time and controls the record's lifetime. The scheduler
+also verifies that a worker is alive and idle; a nonzero ID alone does not
 establish either condition. Terminal `worker_id` is historical attribution,
 not a continuing reservation of that worker.
 
@@ -144,18 +145,19 @@ Checking the worker ID alone would accept the wrong report in this example.
 Attempt numbers distinguish repeated assignments even to the same worker. They
 use 64 bits so the largest 32-bit retry allowance plus the initial attempt fits.
 The defined job messages carry the attempt along with job and worker identity.
-Their future handlers must validate the sending connection before calling these operations.
+Their coordinator handlers validate the sending connection before calling these operations.
 
 These are record transitions only. Calling fail does not insert anything into
 a FIFO, send another assignment, or run another task. An explicit successful
-queue push would add the retried ID to the back. Automatic retry, leases,
-worker-death integration, and recovery remain later work. The model preserves
+queue push adds the retried ID to the back. The scheduler now performs that
+insertion for task failure and worker loss. Execution leases and persistence
+recovery remain later work. The model preserves
 only the current/latest attempt's metadata, not a full attempt history.
 
 ## Timestamp rules
 
 Times are coordinator `CLOCK_MONOTONIC` milliseconds. The caller obtains them
-through the existing clock helper when runtime job handling is added. They are
+through the existing clock helper during runtime job handling. They are
 not wall-clock dates or worker-provided timestamps. Equal timestamps are valid:
 multiple events can occur in one millisecond. Going backward is rejected.
 

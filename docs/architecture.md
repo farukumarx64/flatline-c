@@ -16,8 +16,10 @@ The [job model](jobs.md) defines records and validated state transitions, includ
 attempt identity and bounded requeue/failure rules. The [FIFO queue](queue.md)
 holds pending IDs in insertion order independently of full job records. The
 [job message codec](job-protocol.md) defines submission, acknowledgment, assignment,
-started, completed, and failed payloads. Runtime job transport/handlers, the job
-store, scheduling, execution, automatic retries, and recovery remain future work.
+started, completed, and failed payloads. [CLI submission and scheduling](scheduling.md)
+now connect the job store and FIFO to live dispatch, validate reports, and apply
+bounded retries on failure or worker loss. Real workers hold one assignment while
+heartbeating. Task execution, result queries, leases, and recovery remain future work.
 
 ## Components and ownership
 
@@ -96,8 +98,9 @@ heartbeat handlers support partial headers and the fixed worker ID payload; see
 [the networking walkthrough](networking.md). The coordinator's
 [worker registry](workers.md) owns IDs independently of reusable socket descriptors.
 The shared message representation supports bounded variable job payloads.
-Runtime job handling will require extending the current 16-byte transport buffers
-and dispatch logic; recognized job headers are safely rejected for now.
+Coordinator transport buffers now fit 1062-byte frames. Runtime handlers accept
+submissions and worker reports, and workers receive assignments with partial-frame
+buffering while keeping heartbeats active.
 
 Before job execution and persistence are implemented, resolve how workers keep
 sending heartbeats during long computations, how job/attempt IDs and retry

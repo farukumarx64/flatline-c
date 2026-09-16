@@ -11,8 +11,10 @@ and ID payload, and uses its assigned ID in periodic HEARTBEAT messages. Timing
 configuration and expiration policy are described in [workers.md](workers.md);
 they add no fields to the wire format. Integration tests also use independent TCP peers.
 Job submission, acknowledgment, assignment, started, completed, and failed
-messages are also defined and tested in the shared codec. Their runtime handlers
-are pending; see the [job message specification](job-protocol.md).
+messages are also defined and tested in the shared codec. CLI submission,
+coordinator scheduling/report handlers, and worker assignment reception now use
+them; see the [job message specification](job-protocol.md) and
+[scheduling guide](scheduling.md). Actual task executors remain future work.
 
 ## Header layout
 
@@ -122,8 +124,15 @@ connections for diagnostics, but does not update heartbeat time. PONG and
 WORKER_REGISTER_ACK are replies and are rejected as incoming requests. Wrong
 lengths, malformed frames, duplicate registration, and invalid heartbeat ownership
 close the offending connection without a protocol error response. The CLI still
-expects one empty PONG per invocation. Nonzero PING/PONG lengths in header tests
+expects one empty PONG for `ping`, or a JOB_SUBMIT_ACK for `submit`. Nonzero PING/PONG lengths in header tests
 exercise generic length encoding, not valid complete messages.
+
+The coordinator also accepts JOB_SUBMIT from unregistered clients and STARTED,
+COMPLETED, and FAILED from registered workers. Job reports must match the
+connection, job owner, attempt, and allowed state transition. Job ACKs and
+assignments are outbound-only at the coordinator. A connection that has submitted
+a job cannot switch to being a registered worker. See the scheduling guide for
+acceptance, capacity, report rejection, and retry behavior.
 
 ## Byte order and examples
 
@@ -293,11 +302,11 @@ A short header is incomplete input, not necessarily a malformed message. The
 current coordinator keeps partial headers per connection, and the CLI uses
 `faultline_recv_exact()` to collect a response. Both detect EOF during a header.
 The coordinator first reads only the bytes remaining in one 12-byte header.
-For a supported worker lifecycle payload, it then collects those bytes in the
-same 16-byte buffer before dispatching. Job payloads exceed this runtime buffer
-and are rejected from their header until job transport and handlers are added. Following frames stay in the socket's receive
-buffer until the coordinator is ready for them. Incorrect lengths are rejected
-as soon as the header is complete.
+For a supported payload, it collects the declared bytes in its bounded 1062-byte
+buffer before dispatching. Following frames stay in the socket's receive buffer
+until the coordinator is ready for them. Invalid outer lengths and disallowed
+message directions are rejected from the header. The worker uses the same maximum
+frame capacity for assignments while maintaining a separate heartbeat deadline.
 
 The header encoding/decoding functions remain independent of transport: they
 do not keep partial-read state, retry sends, or close connections. See

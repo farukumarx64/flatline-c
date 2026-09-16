@@ -26,9 +26,11 @@ Its operations reject invalid transitions and stale reports. A coordinator FIFO
 module now holds up to 256 pending job IDs, preserves insertion order, and rejects
 duplicates or overflow. The shared protocol codec now encodes and validates job
 submission, acknowledgment, assignment, started, completed, and failed messages,
-including bounded arguments/results and attempt identity. Jobs are not yet
-submitted or executed by the running programs; transport handlers, the job store,
-and scheduling will connect these pieces.
+including bounded arguments/results and attempt identity. The CLI now submits
+jobs and receives IDs. The coordinator retains up to 256 full job records and
+assigns the oldest queued job to an alive, idle worker. Reports update job state;
+worker loss and task failures apply bounded retries. Real workers accept and
+hold assignments while heartbeating; built-in task execution remains next.
 
 ## Build and run
 
@@ -115,6 +117,29 @@ Sanitizer builds stop on detected undefined behavior. Normal and sanitizer
 outputs live in separate directories. Use `make clean` to remove both; also
 clean before changing compilers or flags within the same build configuration.
 
+## Submit and schedule jobs
+
+With the coordinator running, submit jobs before or after starting workers:
+
+```sh
+./build/debug/faultline submit hash --args "hello" --max-retries 1
+# job_id=1
+./build/debug/faultline submit hash --args-hex 00aaff
+# job_id=2
+```
+
+The coordinator queues jobs until an idle worker is available, then assigns them
+in FIFO order. Each real worker accepts one job and logs `execution=pending`
+while continuing heartbeats. Executors are not implemented yet, so a held job
+remains ASSIGNED. Controlled peers in the tests send execution reports to verify
+completion, worker reuse, and retries. CLI result/status queries are still pending.
+
+Arguments are passed through as text or hex-decoded bytes, up to 1024 bytes.
+Retry allowance defaults to zero. The store retains 256 total jobs, including
+terminal records; full stores reject further submissions, and restarting loses
+all in-memory jobs. See [the scheduling guide](docs/scheduling.md) for CLI options,
+acceptance guarantees, worker eligibility, retries, and the current limits.
+
 ## Tests
 
 ```sh
@@ -125,6 +150,7 @@ make test-sanitize
 Both commands build and run C unit tests and Python integration tests against
 the real executables. `test-sanitize` instruments all C programs under test.
 Use `make test-unit` or `make test-integration` to run either layer separately.
+Use `make test-scheduling` for CLI submission and scheduling scenarios.
 Use `make test-failures` to run only the five failure-detection scenarios, or
 `make SANITIZE=1 test-failures` to run them with AddressSanitizer/UBSan.
 
@@ -150,13 +176,14 @@ faultline/
 │   ├── networking.md
 │   ├── workers.md
 │   ├── jobs.md
-│   └── queue.md
+│   ├── queue.md
+│   └── scheduling.md
 ├── include/             Shared C headers
 ├── src/
 │   ├── common/          Shared protocol, networking, and logging code
-│   ├── coordinator/     Event loop, worker registry, job model, and FIFO queue
-│   ├── worker/          Worker registration and periodic heartbeats
-│   └── cli/             Client entry point and future implementation
+│   ├── coordinator/     Event loop, worker registry, job store, and scheduler
+│   ├── worker/          Registration, heartbeats, and assignment reception
+│   └── cli/             PING and job submission
 └── tests/               Protocol/registry/job/queue/socket tests and TCP integration tests
 ```
 
@@ -170,5 +197,6 @@ IDs, connection ownership, and heartbeat timing. The [job guide](docs/jobs.md)
 defines the record, state transitions, attempt identity, and retry limits.
 The [queue guide](docs/queue.md) explains FIFO ordering, capacity, and job ownership.
 The [job message specification](docs/job-protocol.md) defines payload offsets,
-message semantics, and validation. Next come submission/storage handlers and
-assignment to available workers.
+message semantics, and validation. The [scheduling guide](docs/scheduling.md)
+connects those pieces to CLI submission and live FIFO dispatch. Next come built-in
+executors and actual worker start/result reporting.

@@ -5,12 +5,12 @@ job messages. Each uses the existing [12-byte version 1 header](protocol.md).
 All metadata integers are unsigned and big-endian; arguments/results are opaque
 bytes. No C struct, enum representation, pointer, or `size_t` is sent directly.
 
-This step implements encoding, decoding, and validation. The running coordinator
-still accepts only PING, worker registration, and heartbeats. Its 16-byte input
-buffer rejects job headers before collecting their payloads. The CLI cannot yet
-submit jobs, and the worker cannot yet receive assignments or report outcomes.
-The job store, larger transport buffers, handlers, scheduler, and executors will
-connect these formats to the [job model](jobs.md) and [FIFO queue](queue.md).
+Encoding, decoding, validation, and runtime submission/assignment/report handlers
+are implemented. The CLI can submit jobs; the coordinator stores and schedules
+them using the [job model](jobs.md) and [FIFO queue](queue.md). Workers receive
+and retain assignments while heartbeating. Actual task executors and real-worker
+execution reports are still pending; controlled peers exercise report handling.
+See [scheduling.md](scheduling.md) for runtime behavior and limits.
 
 ## Message overview
 
@@ -55,7 +55,7 @@ terminating NUL is appended or required.
 
 `max_retries` counts additional attempts after the first. Zero permits one
 attempt; two permits up to three. All 32-bit unsigned values are structurally
-valid. The future acceptance handler may impose a lower operational policy.
+valid. The current acceptance handler preserves that value; policy may be tightened later.
 The retry budget stays coordinator-owned and is not included in assignments.
 
 `JOB_SUBMIT_ACK` has just one field:
@@ -65,7 +65,7 @@ The retry budget stays coordinator-owned and is not included in assignments.
 | 0 | 8 | Coordinator-issued `job_id`, nonzero |
 
 Its meaning is successful acceptance into the coordinator's job store and FIFO.
-The future handler must ACK only after both succeed; queue/store exhaustion
+The coordinator ACKs only after both succeed; queue/store exhaustion
 cannot produce a success ACK. This is not a completion result or a durability
 promise. Persistence and the ACK/WAL flush policy come later.
 
@@ -100,14 +100,14 @@ not whether a particular job, worker, or attempt currently exists.
 | 26 | `argument_length` | Argument bytes |
 
 The worker must compare the assigned worker ID with its own registered identity.
-The future coordinator scheduler must select an alive, idle worker, assign the
-model record, and use that record's new attempt number in this message. Reliable
-send/queue removal and failure handling remain runtime work.
+The coordinator scheduler selects an alive, idle worker, assigns the model
+record, and uses its new attempt number. It reserves that worker before queuing
+the output frame and handles transport failures through the retry policy.
 
 ## Started, completed, and failed reports
 
 `JOB_STARTED` contains only the common 20-byte identity. It reports that this
-attempt began execution; its intended model operation is `faultline_job_start()`.
+attempt began execution; its model operation is `faultline_job_start()`.
 It does not include a worker timestamp. The coordinator timestamps accepted
 reports using its own monotonic clock.
 
@@ -118,7 +118,7 @@ reports using its own monotonic clock.
 | 20 | 4 | `result_length` (0–1024) |
 | 24 | `result_length` | Result bytes |
 
-The intended model operation is `faultline_job_complete()`. STARTED must be
+The coordinator uses `faultline_job_complete()` for an accepted report. STARTED must be
 accepted before COMPLETED: completion moves RUNNING → DONE. An empty result is
 valid. The result goes to the coordinator's authoritative job record; result
 retrieval by the CLI will need later handlers/messages.
@@ -135,16 +135,17 @@ text in this first payload. NONE=0, WORKER_LOST=2, and unknown values are invali
 on the wire. WORKER_LOST is a decision made locally by the coordinator when a
 connection fails or heartbeats expire; a worker cannot report itself lost.
 
-`JOB_FAILED` means **this attempt failed**. The future handler calls
+`JOB_FAILED` means **this attempt failed**. The coordinator handler calls
 `faultline_job_fail()` with TASK. The model returns to QUEUED when retry allowance
 remains, or reaches terminal FAILED when it is exhausted. An explicit queue push
-is still required to make the retry pending. The message itself neither retries
+is performed by the scheduler to make the retry pending. The message itself neither retries
 nor changes the state of a record.
 
-Future report handlers must validate the sending connection and its registered
+Coordinator report handlers validate the sending connection and its registered
 worker ID, find the job by ID, and check ownership, attempt, and state through the
-model API. Valid bytes alone do not authorize an update. Duplicate/stale report
-policy and worker-death retry integration remain runtime work.
+model API. Invalid/duplicate/stale reports close the sending connection without
+applying the report. Normal worker-loss cleanup then handles any active assignment
+on that connection. Valid bytes alone do not authorize an update.
 
 ## Example exchange
 
@@ -244,8 +245,8 @@ mixed heartbeat/job streams; and a decoded old attempt rejected by the model.
 Every rejected codec call is checked for unchanged outputs. Existing lifecycle
 vectors still verify their original bytes and null-pointer contracts.
 
-The TCP integration suite checks that valid job headers, including maximum-size
-ones, are rejected safely by the current runtime while another registered worker
-continues heartbeating and PING/PONG remains usable. It does not claim a live job
-exchange. Run `make test-unit`, `make SANITIZE=1 test-unit`, and
-`make test-integration` for these checks.
+TCP integration tests cover CLI acceptance, live FIFO dispatch, fragment handling,
+worker identity, validated reports, and retries. The real worker retains its
+assignment until executors are added; controlled TCP peers send start/result/failure
+reports. Wrong-direction job headers remain rejected before collecting payloads.
+Run `make test-unit`, `make SANITIZE=1 test-unit`, and `make test-integration`.

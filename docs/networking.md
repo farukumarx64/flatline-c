@@ -4,7 +4,9 @@ Faultline can now start a coordinator on `127.0.0.1:9000`, accept a CLI connecti
 receive a binary PING header, and send a binary PONG header. The coordinator also
 accepts registration and heartbeat frames and owns a [worker registry](workers.md).
 The worker executable connects, registers, and sends periodic heartbeats through
-the same protocol. The coordinator expires silent workers. Job scheduling is still to come.
+the same protocol. The coordinator expires silent workers.
+[CLI submission and FIFO scheduling](scheduling.md) now extend this transport to
+job payloads; the explanation below covers both lifecycle and job traffic.
 
 ## Run it
 
@@ -88,8 +90,12 @@ request, coordinator activity, or the next heartbeat deadline. It encodes a
 one interval after the complete ACK. Later deadlines start at local send completion,
 so a delayed worker sends no catch-up burst. A `heartbeat_sent` log records local
 send completion; only the coordinator's `heartbeat_received` log proves processing.
-EOF, reset, a send failure, or unexpected incoming bytes produce
-an error and a failure exit; future job handling will replace that last case.
+EOF, reset, a send failure, or invalid incoming frames produce
+an error and a failure exit. Valid JOB_ASSIGN frames are accumulated in a
+1062-byte buffer, validated against the registered worker ID, and retained.
+A worker holding an assignment remains busy while sending heartbeats; actual
+execution comes next. A partial assignment has one five-second receive deadline
+from its first byte, independent of the heartbeat deadline.
 The worker reads exactly the ACK size so additional bytes cannot be silently
 swallowed by the registration receive loop. Local SIGINT/SIGTERM requests close
 the socket and produce a successful exit. There is no automatic reconnect loop.
@@ -104,7 +110,7 @@ READING_MESSAGE -> WRITING_REPLY -> READING_MESSAGE -> ...
 READING_MESSAGE -> record heartbeat -> READING_MESSAGE -> ...
 ```
 
-Each client owns 16-byte input and output buffers, received/sent byte counters,
+Each client owns 1062-byte input and output buffers, received/sent byte counters,
 the expected input size, the actual output size, its phase, and a monotonic
 timestamp of its last byte-transfer progress. It also stores its assigned
 worker ID, or zero if the connection has not registered.
@@ -113,17 +119,22 @@ In the read phase, the loop requests `POLLIN`. A `recv()` call asks for only the
 bytes still needed for the header. Positive results advance the receive counter.
 Once 12 bytes are present, the complete-message decoder either returns an empty
 message, rejects the frame, or reports that a valid payload is incomplete. For
-a payload-bearing frame the coordinator raises the expected size to 16 and
-reads only the remaining four bytes before decoding again.
+a payload-bearing frame the coordinator raises the expected size to header +
+payload length and reads only those remaining bytes before decoding again.
+This still gives 16 bytes for a heartbeat; job payloads can be larger.
 
 PING queues PONG. WORKER_REGISTER adds an ALIVE registry entry with a fresh ID
 and queues an ACK carrying that ID. A valid HEARTBEAT updates only the sending
 worker's registry timestamp and resets the input state without queuing a reply.
 Duplicate registration and incorrect heartbeat IDs close the offending connection.
+JOB_SUBMIT stores and enqueues a job before queuing its ACK. STARTED, COMPLETED,
+and FAILED update the matching active job through the scheduler. A malformed or
+unauthorized report closes its sender's connection and triggers normal loss cleanup.
 
 In the write phase, the loop requests `POLLOUT`. A `send()` call uses the remaining
 part of the reply buffer and advances the sent counter by the actual result.
-After the actual reply length (12 for PONG, 16 for registration ACK) has been
+After the actual frame length (12 for PONG, 16 for registration ACK, or the
+encoded size for job ACKs/assignments) has been
 accepted by the local socket, the client returns to reading a new header.
 The `pong_sent` and `worker_register_ack_sent` logs record local send completion,
 not proof that the remote application received the response.
@@ -138,7 +149,9 @@ wait for one connection's whole operation.
 If several PINGs arrive together, the coordinator reads exactly one header,
 responds, and then reads the next. Later bytes remain in the kernel's receive
 buffer. The same rule preserves frame boundaries for registration and heartbeat
-payloads. Larger job payloads will require extending the bounded input storage.
+and job payloads. After processing events, the scheduler can queue an assignment
+for an eligible idle worker. It skips connections with pending output or partial
+input, and a queued assignment reserves the worker before any send occurs.
 
 ## Partial I/O and errors
 

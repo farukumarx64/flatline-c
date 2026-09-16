@@ -11,6 +11,8 @@ These run protocol, registry, job, queue, and socket unit tests written in C plu
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
+Use `make test-scheduling` for CLI submission and scheduling, or
+`make SANITIZE=1 test-scheduling` for instrumented binaries.
 Use `make test-failures` for the dedicated failure-detection suite, or
 `make SANITIZE=1 test-failures` for the same checks against instrumented binaries.
 
@@ -117,8 +119,8 @@ Stale IDs cannot update or kill its replacement worker. Churn exceeds the
   beyond UINT32_MAX attempts, without billions of iterations or counter wrap.
 
 These tests need no sockets or sleeps. They verify model-level transitions only;
-there is no job submission, executor, or automatic retry in the running
-programs yet. The job model links into the coordinator and the job/queue/job-message test
+runtime submission and retries are now covered by the scheduler tests below.
+Built-in executors remain future work. The job model links into the coordinator and the job/queue/job-message/scheduler test
 binaries; the CLI and worker do not link its transition implementation.
 
 `test_job_queue.c` adds seven FIFO test groups:
@@ -142,6 +144,35 @@ Application code must keep authoritative records in its own store. Queue code
 links into the coordinator and its test binary; the queue tests also link the
 job model to exercise assignment and retry ordering.
 
+`test_scheduler.c` adds six groups covering atomic store/queue acceptance,
+unique IDs and owned arguments, immediate busy reservation, FIFO dispatch,
+validated reports and result retention, worker release, retry ordering and old
+attempt rejection, worker loss, full-store rejection with guaranteed retry room,
+and ID exhaustion. Rejected operations preserve scheduler/output snapshots.
+
+`integration/test_scheduling.py` adds 15 scenarios, with a fresh coordinator per
+test to isolate retained job records:
+
+- Jobs accepted without workers, FIFO assignments to two workers, busy exclusion,
+  and next-job dispatch after a controlled worker reports completion.
+- Concurrent real CLI submissions receiving unique IDs in enqueue order.
+- Fragmented/coalesced submissions with maximum-sized binary arguments.
+- An incoming partial heartbeat preserved while a job waits for dispatch.
+- Task failure/disconnect retry order and terminal failure after exhaustion.
+- Spoofed worker IDs and stale reports cannot complete another/current attempt.
+- Exactly 256 retained records, rejected overflow without ACK, and preserved older jobs.
+- Real workers retain one assignment, keep heartbeating, and receive no second job.
+- Assignment fragments do not suppress real-worker heartbeats.
+- Invalid/truncated submissions consume no IDs; registered workers cannot submit.
+- Heartbeat expiry on an open assigned connection reassigns to a healthy idle worker.
+- Wrong assignment identity and partial-frame timeout cause worker failure exit.
+- Independent peers verify CLI task/argument/retry bytes and fragmented 64-bit ACKs.
+- CLI option validation and malformed/truncated/zero-ID ACK rejection.
+- A single five-second CLI ACK deadline across header and payload.
+
+Controlled peers produce execution reports; real worker executors remain pending.
+The scheduler links only into the coordinator and its test binary.
+
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
 Its original 15 scenarios cover a successful exchange and sequential clients, default
 port behavior, fragmented PING and PONG, repeated/coalesced frames, concurrent
@@ -159,10 +190,11 @@ duplicate registration, truncated/invalid worker frames, and an idle registered
 worker alongside a stalled payload. The stalled payload times out and marks its
 worker dead; the idle worker expires under the default six-second heartbeat timeout.
 
-One additional scenario sends all six valid job header types and the largest
-variable declarations while keeping each peer open. The current 16-byte runtime
-receiver must reject them before reading payload data; another registered worker
-must continue heartbeating and PING/PONG must remain usable.
+One additional scenario rejects job replies/assignments sent to the coordinator,
+and worker reports sent by unregistered clients. Valid JOB_SUBMIT is now handled
+by the runtime and is covered by the scheduling suite. A healthy worker remains
+usable while incorrect-direction frames are rejected.
+
 Logs verify state transitions and timestamp updates, including that PING
 and incomplete heartbeat bytes do not count as heartbeats. Positional log reads
 avoid moving the file offset shared with the coordinator's output stream.
