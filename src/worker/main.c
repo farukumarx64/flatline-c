@@ -1,11 +1,14 @@
 #include "net.h"
 #include "protocol.h"
+#include "task.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -133,7 +136,90 @@ static int receive_registration_ack(int fd, uint32_t *worker_id)
     return 0;
 }
 
-static int run_worker(int fd, uint32_t worker_id, int interval_ms)
+struct execution {
+    struct faultline_job_assign_payload assignment;
+    struct faultline_task_result result;
+    enum faultline_task_status status;
+    pthread_t thread;
+    int thread_created;
+    atomic_bool cancel;
+    atomic_bool done;
+};
+
+static void *execute_task(void *argument)
+{
+    struct execution *execution = argument;
+    const struct faultline_job_assign_payload *job = &execution->assignment;
+    execution->status = faultline_task_execute(job->task_type, job->arguments,
+        job->argument_size, &execution->cancel, &execution->result);
+    /* Publish the result before the networking thread is allowed to read it. */
+    atomic_store(&execution->done, true);
+    return NULL;
+}
+
+static int start_execution(struct execution *execution)
+{
+    sigset_t blocked, previous;
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGINT);
+    (void)sigaddset(&blocked, SIGTERM);
+    /* The task inherits this mask; only the main thread runs our stop handler. */
+    int error = pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+    if (error != 0) { return error; }
+    atomic_store(&execution->cancel, false);
+    atomic_store(&execution->done, false);
+    error = pthread_create(&execution->thread, NULL, execute_task, execution);
+    execution->thread_created = error == 0;
+    int restore_error = pthread_sigmask(SIG_SETMASK, &previous, NULL);
+    return restore_error != 0 ? restore_error : error;
+}
+
+static int send_message(int fd, const struct faultline_message *message)
+{
+    uint8_t wire[FAULTLINE_MESSAGE_MAX_FRAME_SIZE];
+    size_t written;
+    if (faultline_message_encode(wire, sizeof(wire), message, &written) != FAULTLINE_PROTOCOL_OK) {
+        fputs("worker: could not encode job report\n", stderr);
+        return -1;
+    }
+    if (faultline_send_all(fd, wire, written, FAULTLINE_IO_TIMEOUT_MS) < 0) {
+        perror("worker: send job report");
+        return -1;
+    }
+    return 0;
+}
+
+static int report_execution(int fd, struct execution *execution)
+{
+    const struct faultline_job_identity identity = execution->assignment.identity;
+    const char *status_name;
+    switch (execution->status) {
+    case FAULTLINE_TASK_OK: status_name = "ok"; break;
+    case FAULTLINE_TASK_INVALID_ARGUMENT: status_name = "invalid_arguments"; break;
+    case FAULTLINE_TASK_CANCELLED: status_name = "cancelled"; break;
+    default: status_name = "system_error"; break;
+    }
+    struct faultline_message report = {0};
+    if (execution->status == FAULTLINE_TASK_OK) {
+        report.message_type = FAULTLINE_MSG_JOB_COMPLETED;
+        report.payload.job_completed.identity = identity;
+        report.payload.job_completed.result_size = execution->result.size;
+        memcpy(report.payload.job_completed.result, execution->result.bytes, execution->result.size);
+    } else {
+        report.message_type = FAULTLINE_MSG_JOB_FAILED;
+        report.payload.job_failed.identity = identity;
+        report.payload.job_failed.failure = FAULTLINE_JOB_FAILURE_TASK;
+    }
+    if (send_message(fd, &report) < 0) { return -1; }
+    printf("[INFO] worker %s job_id=%" PRIu64 " worker_id=%" PRIu32
+           " attempt=%" PRIu64 " task_status=%s result_bytes=%zu\n",
+           execution->status == FAULTLINE_TASK_OK ? "job_completed_sent" : "job_failed_sent",
+           identity.job_id, identity.worker_id, identity.attempt, status_name,
+           execution->status == FAULTLINE_TASK_OK ? execution->result.size : 0);
+    return 0;
+}
+
+static int worker_loop(int fd, uint32_t worker_id, int interval_ms, struct execution *execution)
 {
     const struct faultline_message heartbeat = {
         .message_type = FAULTLINE_MSG_HEARTBEAT, .payload.worker_id = worker_id
@@ -143,7 +229,6 @@ static int run_worker(int fd, uint32_t worker_id, int interval_ms)
     uint8_t input[FAULTLINE_MESSAGE_MAX_FRAME_SIZE];
     size_t received = 0, expected = FAULTLINE_HEADER_SIZE;
     int64_t frame_started = -1;
-    struct faultline_job_assign_payload active = {0};
     int64_t now = faultline_monotonic_ms();
     int64_t next_heartbeat;
 
@@ -158,7 +243,23 @@ static int run_worker(int fd, uint32_t worker_id, int interval_ms)
     }
     next_heartbeat = now + interval_ms;
     while (!stopping) {
+        if (execution->thread_created && atomic_load(&execution->done)) {
+            int error = pthread_join(execution->thread, NULL);
+            if (error != 0) {
+                fprintf(stderr, "worker: join task: %s\n", strerror(error));
+                return EXIT_FAILURE;
+            }
+            execution->thread_created = 0;
+            if (stopping) { break; }
+            if (report_execution(fd, execution) < 0) { return EXIT_FAILURE; }
+            /* Ownership is released only after the complete terminal frame was sent. */
+            execution->assignment.identity.job_id = 0;
+        }
+        now = faultline_monotonic_ms();
+        if (now < 0) { perror("worker: clock"); return EXIT_FAILURE; }
         int64_t deadline = next_heartbeat;
+        /* Poll completion at most 50 ms later, without a busy loop or a second socket writer. */
+        if (execution->thread_created && now + 50 < deadline) { deadline = now + 50; }
         if (frame_started >= 0 && frame_started + FAULTLINE_IO_TIMEOUT_MS < deadline) {
             deadline = frame_started + FAULTLINE_IO_TIMEOUT_MS;
         }
@@ -218,21 +319,54 @@ static int run_worker(int fd, uint32_t worker_id, int interval_ms)
         struct faultline_message message;
         size_t consumed;
         if (faultline_message_decode(input, received, &message, &consumed) != FAULTLINE_PROTOCOL_OK ||
-            message.payload.job_assign.identity.worker_id != worker_id || active.identity.job_id != 0) {
+            message.payload.job_assign.identity.worker_id != worker_id ||
+            execution->assignment.identity.job_id != 0) {
             fputs("worker: invalid assignment or worker already busy\n", stderr);
             return EXIT_FAILURE;
         }
-        active = message.payload.job_assign;
+        execution->assignment = message.payload.job_assign;
+        const struct faultline_job_assign_payload *active = &execution->assignment;
         printf("[INFO] worker job_assigned job_id=%" PRIu64 " worker_id=%" PRIu32
-               " attempt=%" PRIu64 " task_type=%u argument_bytes=%zu execution=pending\n",
-               active.identity.job_id, worker_id, active.identity.attempt,
-               (unsigned int)active.task_type, active.argument_size);
-        /* Keep ownership and heartbeats until task executors can process active. */
+               " attempt=%" PRIu64 " task_type=%u argument_bytes=%zu\n",
+               active->identity.job_id, worker_id, active->identity.attempt,
+               (unsigned int)active->task_type, active->argument_size);
+        const struct faultline_message started = {
+            .message_type = FAULTLINE_MSG_JOB_STARTED, .payload.job_started = active->identity
+        };
+        if (stopping) { break; }
+        if (send_message(fd, &started) < 0) { return EXIT_FAILURE; }
+        int error = start_execution(execution);
+        if (error != 0) {
+            fprintf(stderr, "worker: start task thread: %s\n", strerror(error));
+            /* A mask-restore failure after creation needs cancellation before exiting. */
+            if (execution->thread_created) { return EXIT_FAILURE; }
+            execution->status = FAULTLINE_TASK_SYSTEM_ERROR;
+            if (report_execution(fd, execution) < 0) { return EXIT_FAILURE; }
+            execution->assignment.identity.job_id = 0;
+        }
         received = 0;
         expected = FAULTLINE_HEADER_SIZE;
         frame_started = -1;
     }
     return EXIT_SUCCESS;
+}
+
+static int run_worker(int fd, uint32_t worker_id, int interval_ms)
+{
+    struct execution execution = {0};
+    atomic_init(&execution.cancel, false);
+    atomic_init(&execution.done, false);
+    int status = worker_loop(fd, worker_id, interval_ms, &execution);
+    /* Every exit path (signal, EOF, bad frame, failed send) stops and joins work. */
+    if (execution.thread_created) {
+        atomic_store(&execution.cancel, true);
+        int error = pthread_join(execution.thread, NULL);
+        if (error != 0) {
+            fprintf(stderr, "worker: join cancelled task: %s\n", strerror(error));
+            return EXIT_FAILURE;
+        }
+    }
+    return status;
 }
 
 int main(int argc, char **argv)

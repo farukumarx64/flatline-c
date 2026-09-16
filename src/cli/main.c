@@ -15,7 +15,10 @@ static void usage(FILE *stream)
           "       faultline submit TASK [--args TEXT | --args-hex HEX]\n"
           "                        [--max-retries N] [--coordinator IPv4:PORT]\n"
           "Tasks: sleep, prime_count, fibonacci, hash. Arguments: at most 1024 bytes.\n"
-          "Arguments are passed through; task execution is not implemented yet.\n"
+          "sleep: milliseconds 0..86400000; prime_count: inclusive bound 0..100000000.\n"
+          "fibonacci: index 0..93; hash: raw bytes, FNV-1a 64-bit checksum.\n"
+          "Numeric arguments must be decimal digits. Workers validate task inputs.\n"
+          "Submission prints a job ID; completed results appear in the coordinator log.\n"
           "Default coordinator: 127.0.0.1:9000; max retries: 0.\n", stream);
 }
 

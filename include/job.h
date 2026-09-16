@@ -71,7 +71,7 @@ int faultline_job_can_transition(enum faultline_job_state from,
 
 /*
  * Initialize fresh storage as QUEUED; now_ms is coordinator monotonic time >= 0.
- * Copies opaque argument bytes; task-specific interpretation comes with executors.
+ * Copies opaque argument bytes; task-specific interpretation belongs to worker executors.
  * NULL data is allowed only for size zero. Source bytes must not overlap *job.
  * max_retries=0 permits one attempt. Every failing API call leaves *job unchanged.
  */

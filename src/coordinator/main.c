@@ -57,9 +57,22 @@ static void log_job(const char *event, const struct faultline_job *job,
                     const struct faultline_scheduler *jobs)
 {
     printf("[INFO] coordinator %s job_id=%" PRIu64 " state=%s worker_id=%" PRIu32
-           " attempt=%" PRIu64 " retry_count=%" PRIu32 " pending=%zu result_bytes=%zu\n",
+           " attempt=%" PRIu64 " retry_count=%" PRIu32 " pending=%zu result_bytes=%zu",
            event, job->id, job_state_name(job->state), job->worker_id,
            job->attempt, job->retry_count, jobs->pending.count, job->result_size);
+    if (job->state == FAULTLINE_JOB_DONE) {
+        fputs(" result=\"", stdout);
+        for (size_t i = 0; i < job->result_size; ++i) {
+            unsigned int byte = job->result[i];
+            if (byte >= 0x20 && byte <= 0x7e && byte != '"' && byte != '\\') {
+                (void)putchar((int)byte);
+            } else {
+                printf("\\x%02x", byte);
+            }
+        }
+        (void)putchar('"');
+    }
+    (void)putchar('\n');
 }
 
 static void close_client(struct client *client,

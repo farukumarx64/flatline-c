@@ -29,8 +29,8 @@ def identity(job_id, worker_id, attempt=1):
     return struct.pack('!QIQ', job_id, worker_id, attempt)
 
 
-def assignment(job_id, worker_id, arguments=b'abc', attempt=1):
-    return frame(8, identity(job_id, worker_id, attempt) + struct.pack('!HI', 4, len(arguments)) + arguments)
+def assignment(job_id, worker_id, arguments=b'abc', attempt=1, task=4):
+    return frame(8, identity(job_id, worker_id, attempt) + struct.pack('!HI', task, len(arguments)) + arguments)
 
 
 def receive_frame(connection):
@@ -41,7 +41,7 @@ def receive_frame(connection):
     return kind, test_ping.receive_exact(connection, size)
 
 
-class SchedulingTests(WorkerProcessTestCase):
+class JobProcessTestCase(WorkerProcessTestCase):
     # Each test needs an empty job store; the shared lifecycle fixture normally
     # keeps its server for a class because it has no retained jobs.
     @classmethod
@@ -90,6 +90,8 @@ class SchedulingTests(WorkerProcessTestCase):
             time.sleep(0.01)
         self.fail(f'Missing {event} for job {job_id}: {read_output(self.log)}')
 
+
+class SchedulingTests(JobProcessTestCase):
     def test_jobs_wait_then_two_workers_receive_fifo_assignments(self):
         first = self.accepted_id(self.submit_cli('hash', '--args', 'abc'))
         second = self.accepted_id(self.submit_cli('hash', '--args', 'second'))
@@ -208,9 +210,9 @@ class SchedulingTests(WorkerProcessTestCase):
         self.assert_pong(self.run_cli())
 
     def test_real_workers_hold_assignments_and_keep_heartbeating(self):
-        first = self.accepted_id(self.submit_cli('hash', '--args', 'abc'))
-        second = self.accepted_id(self.submit_cli('hash', '--args', 'abc'))
-        third = self.accepted_id(self.submit_cli('hash', '--args', 'abc'))
+        first = self.accepted_id(self.submit_cli('sleep', '--args', '60000'))
+        second = self.accepted_id(self.submit_cli('sleep', '--args', '60000'))
+        third = self.accepted_id(self.submit_cli('sleep', '--args', '60000'))
         with self.worker_process(interval_ms=100) as (a, out_a, err_a), \
                 self.worker_process(interval_ms=100) as (b, out_b, err_b):
             a_id = self.wait_for_registration(a, out_a, err_a)
@@ -221,10 +223,10 @@ class SchedulingTests(WorkerProcessTestCase):
             for worker_id, process, output in ((a_id, a, out_a), (b_id, b, out_b)):
                 self.assertIsNone(process.poll())
                 self.assertEqual(read_output(output).count('worker job_assigned'), 1)
-                self.assertIn('execution=pending', read_output(output))
                 self.assertGreaterEqual(len(self.worker_events('heartbeat_received', worker_id)), 2)
             self.assertNotIn(f'job_assigned job_id={third}', read_output(self.log))
-            self.assertNotIn('job_started', read_output(self.log))
+            self.assertEqual(self.wait_job_event('job_started', first)['state'], 'RUNNING')
+            self.assertEqual(self.wait_job_event('job_started', second)['state'], 'RUNNING')
             self.stop_worker(a, err_a)
             self.wait_for_worker_event('worker_dead', a_id)
             with self.worker_process(interval_ms=100) as (c, out_c, err_c):
@@ -237,7 +239,7 @@ class SchedulingTests(WorkerProcessTestCase):
         with self.fake_coordinator(interval_ms=80) as (connection, process, output, errors):
             connection.sendall(test_ping.REGISTER_ACK_HEADER + struct.pack('!I', 7))
             self.wait_for_registration(process, output, errors)
-            request = assignment(42, 7, b'a\x00b' * 300)
+            request = assignment(42, 7, b'60000', task=1)
             offset = 0
             for size in (1, 11, 13, len(request) - 26):
                 connection.sendall(request[offset:offset + size])
@@ -249,7 +251,7 @@ class SchedulingTests(WorkerProcessTestCase):
             deadline = time.monotonic() + 2
             while 'job_assigned' not in read_output(output) and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertIn('job_id=42 worker_id=7 attempt=1 task_type=4 argument_bytes=900', read_output(output))
+            self.assertIn('job_id=42 worker_id=7 attempt=1 task_type=1 argument_bytes=5', read_output(output))
             connection.sendall(assignment(43, 7))
             self.assertEqual(process.wait(timeout=2), 1)
             self.assertIn('already busy', read_output(errors))

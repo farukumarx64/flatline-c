@@ -23,16 +23,17 @@ REGISTRY_OBJECT := $(BUILD_DIR)/coordinator/worker_registry.o
 JOB_OBJECT := $(BUILD_DIR)/coordinator/job.o
 QUEUE_OBJECT := $(BUILD_DIR)/coordinator/job_queue.o
 SCHEDULER_OBJECT := $(BUILD_DIR)/coordinator/scheduler.o
+TASK_OBJECT := $(BUILD_DIR)/worker/task.o
 MAIN_OBJECTS := $(BUILD_DIR)/coordinator/main.o \
 	$(BUILD_DIR)/worker/main.o $(BUILD_DIR)/cli/main.o
-TEST_NAMES := test_protocol test_messages test_net test_worker_registry test_jobs test_job_queue test_job_messages test_scheduler
+TEST_NAMES := test_protocol test_messages test_net test_worker_registry test_jobs test_job_queue test_job_messages test_scheduler test_tasks
 TEST_OBJECTS := $(addprefix $(BUILD_DIR)/tests/,$(addsuffix .o,$(TEST_NAMES)))
-OBJECTS := $(COMMON_OBJECTS) $(MAIN_OBJECTS) $(TEST_OBJECTS) $(REGISTRY_OBJECT) $(JOB_OBJECT) $(QUEUE_OBJECT) $(SCHEDULER_OBJECT)
+OBJECTS := $(COMMON_OBJECTS) $(MAIN_OBJECTS) $(TEST_OBJECTS) $(REGISTRY_OBJECT) $(JOB_OBJECT) $(QUEUE_OBJECT) $(SCHEDULER_OBJECT) $(TASK_OBJECT)
 PROGRAMS := $(BUILD_DIR)/faultline-coordinator \
 	$(BUILD_DIR)/faultline-worker $(BUILD_DIR)/faultline
 TEST_PROGRAMS := $(addprefix $(BUILD_DIR)/tests/,$(TEST_NAMES))
 
-.PHONY: all sanitize test test-unit test-integration test-failures test-scheduling test-sanitize clean
+.PHONY: all sanitize test test-unit test-integration test-failures test-scheduling test-execution test-sanitize clean
 
 all: $(PROGRAMS)
 
@@ -50,8 +51,10 @@ test-unit: $(TEST_PROGRAMS)
 	./$(BUILD_DIR)/tests/test_job_queue
 	./$(BUILD_DIR)/tests/test_job_messages
 	./$(BUILD_DIR)/tests/test_scheduler
+	./$(BUILD_DIR)/tests/test_tasks
 
 test-integration: all
+	$(PYTHON) tests/integration/test_execution.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
 	$(PYTHON) tests/integration/test_failure_detection.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
 	$(PYTHON) tests/integration/test_scheduling.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
 	$(PYTHON) tests/integration/test_ping.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
@@ -60,6 +63,9 @@ test-integration: all
 
 test-scheduling: all
 	$(PYTHON) tests/integration/test_scheduling.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
+
+test-execution: all
+	$(PYTHON) tests/integration/test_execution.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
 
 test-failures: all
 	$(PYTHON) tests/integration/test_failure_detection.py --bin-dir $(BUILD_DIR) $(INTEGRATION_ARGS)
@@ -70,7 +76,7 @@ test-sanitize:
 $(BUILD_DIR)/faultline-coordinator: $(BUILD_DIR)/coordinator/main.o $(COMMON_OBJECTS) $(REGISTRY_OBJECT) $(JOB_OBJECT) $(QUEUE_OBJECT) $(SCHEDULER_OBJECT)
 	$(CC) $(CFLAGS) $(PROJECT_CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD_DIR)/faultline-worker: $(BUILD_DIR)/worker/main.o $(COMMON_OBJECTS)
+$(BUILD_DIR)/faultline-worker: $(BUILD_DIR)/worker/main.o $(COMMON_OBJECTS) $(TASK_OBJECT)
 	$(CC) $(CFLAGS) $(PROJECT_CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(BUILD_DIR)/faultline: $(BUILD_DIR)/cli/main.o $(COMMON_OBJECTS)
@@ -86,6 +92,11 @@ $(BUILD_DIR)/tests/test_jobs $(BUILD_DIR)/tests/test_job_messages: $(JOB_OBJECT)
 $(BUILD_DIR)/tests/test_job_queue: $(JOB_OBJECT) $(QUEUE_OBJECT)
 
 $(BUILD_DIR)/tests/test_scheduler: $(JOB_OBJECT) $(QUEUE_OBJECT) $(SCHEDULER_OBJECT)
+
+$(BUILD_DIR)/tests/test_tasks: $(TASK_OBJECT)
+
+$(BUILD_DIR)/worker/main.o $(BUILD_DIR)/tests/test_tasks.o: PROJECT_CFLAGS += -pthread
+$(BUILD_DIR)/faultline-worker $(BUILD_DIR)/tests/test_tasks: LDLIBS += -pthread
 
 $(BUILD_DIR)/tests/%.o: tests/%.c
 	@mkdir -p $(@D)
