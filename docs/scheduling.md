@@ -6,11 +6,11 @@ in `src/coordinator/scheduler.c`, with its public API in `include/scheduler.h`.
 It combines the existing [job model](jobs.md), [FIFO](queue.md), and
 [job message formats](job-protocol.md) without embedding sockets or clocks.
 
-Real workers accept and retain one assignment while continuing heartbeats. They
-log `execution=pending`: built-in executors have not been implemented, so these
-workers do not yet send STARTED, COMPLETED, or FAILED reports. Controlled TCP
-workers exercise those coordinator handlers in the integration tests. Task
-execution, CLI result/status queries, and persistence remain later work.
+Real workers execute one assignment at a time while continuing heartbeats. They
+send STARTED, then COMPLETED with a result or FAILED with the TASK reason. The
+coordinator stores and logs completed results and schedules the next queued job.
+See [built-in task execution](tasks.md) for algorithms, inputs, and thread ownership.
+CLI result/status queries and persistence remain later work.
 
 ## Try it
 
@@ -22,9 +22,9 @@ workers to see that acceptance does not require an available worker:
 ./build/debug/faultline-coordinator --port 9000
 
 # Terminal 2
-./build/debug/faultline submit hash --args "first"
+./build/debug/faultline submit sleep --args 10000
 # job_id=1
-./build/debug/faultline submit hash --args "second"
+./build/debug/faultline submit sleep --args 10000
 # job_id=2
 
 # Terminal 3
@@ -37,9 +37,10 @@ workers to see that acceptance does not require an available worker:
 A fresh coordinator assigns job 1 first and job 2 second. Which process becomes
 the first worker depends on registration timing. The coordinator logs submission
 and assignment; each worker logs its job ID, worker ID, attempt, task type,
-argument byte count, and `execution=pending`. Both remain alive and send heartbeats.
-A third job waits while those workers hold their assignments. Stopping a worker
-marks its assignment failed or requeues it according to the retry allowance.
+and argument byte count. Both sleep for ten seconds while sending heartbeats.
+A third job waits while both are busy, then runs after a worker reports its result.
+The coordinator logs `result="slept_ms=10000"` for each completed sleep. Stopping a
+busy worker marks its assignment failed or requeues it according to the retry allowance.
 
 Use `--coordinator 127.0.0.1:PORT` to change the CLI or worker endpoint. Defaults
 remain `127.0.0.1:9000`. Existing `faultline ping` behavior is unchanged.
@@ -65,9 +66,9 @@ faultline submit TASK [--args TEXT | --args-hex HEX]
   signs, whitespace, fractions, overflow, duplicate options, and missing values
   are rejected before connecting.
 
-All valid option pairs may appear in any order after TASK. Task-specific
-argument/result validation will be added with the executors; accepting a task
-identifier and bounded bytes does not mean the task can execute yet.
+All valid option pairs may appear in any order after TASK. The worker validates
+[task-specific arguments](tasks.md); acceptance of a task identifier and bounded
+bytes does not guarantee success. Invalid numeric inputs become TASK failures.
 
 The CLI sends one JOB_SUBMIT and waits for JOB_SUBMIT_ACK. It validates the type,
 exact eight-byte payload length, and nonzero 64-bit job ID before printing
@@ -187,9 +188,10 @@ already holding a job before retaining the assignment. Unexpected frames, invali
 identity, a second assignment while busy, EOF, or a stalled partial frame cause
 failure exit. Local SIGINT/SIGTERM still closes the socket and exits successfully.
 
-A held assignment stays ASSIGNED at the coordinator. The real worker sends no
-fabricated execution reports. Implementing built-in tasks and reporting their
-actual start and outcome is the next milestone.
+After validation, the worker sends STARTED and launches its task thread. The main
+thread keeps heartbeats active, joins completed work, and sends the terminal
+report before clearing local ownership. All exit paths cancel and join active
+work; [tasks.md](tasks.md) explains synchronization and result formatting.
 
 ## Tests
 

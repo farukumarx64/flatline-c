@@ -93,8 +93,8 @@ send completion; only the coordinator's `heartbeat_received` log proves processi
 EOF, reset, a send failure, or invalid incoming frames produce
 an error and a failure exit. Valid JOB_ASSIGN frames are accumulated in a
 1062-byte buffer, validated against the registered worker ID, and retained.
-A worker holding an assignment remains busy while sending heartbeats; actual
-execution comes next. A partial assignment has one five-second receive deadline
+A worker executes one assignment in a task thread while its main thread sends
+heartbeats and reports results; see [tasks.md](tasks.md). A partial assignment has one five-second receive deadline
 from its first byte, independent of the heartbeat deadline.
 The worker reads exactly the ACK size so additional bytes cannot be silently
 swallowed by the registration receive loop. Local SIGINT/SIGTERM requests close
@@ -229,7 +229,7 @@ EOF, I/O errors, protocol rejection, stalled transfers, heartbeat expiry, and co
 
 The coordinator currently listens only on IPv4 loopback. The CLI and worker accept a
 numeric IPv4 address. There is no hostname resolution, IPv6, automatic worker
-reconnection, job execution, or persistence yet.
+reconnection or persistence yet.
 Logs provide basic event
 visibility; full timestamped structured logging remains future work.
 

@@ -14,7 +14,7 @@ It checks incoming heartbeat IDs against their connections and marks workers
 dead on disconnect or heartbeat expiry. The worker executable connects, registers,
 prints its assigned ID, and sends a heartbeat every two seconds. The coordinator
 expires a worker after six seconds without a valid heartbeat. Both durations are
-configurable. Job execution and persistence are future work.
+configurable. Built-in task execution is implemented; persistence remains future work.
 
 Dedicated failure tests distinguish worker exit and TCP reset from missed
 heartbeats on an open connection. A healthy worker and the CLI must remain usable
@@ -29,12 +29,13 @@ submission, acknowledgment, assignment, started, completed, and failed messages,
 including bounded arguments/results and attempt identity. The CLI now submits
 jobs and receives IDs. The coordinator retains up to 256 full job records and
 assigns the oldest queued job to an alive, idle worker. Reports update job state;
-worker loss and task failures apply bounded retries. Real workers accept and
-hold assignments while heartbeating; built-in task execution remains next.
+worker loss and task failures apply bounded retries. Workers execute `sleep`,
+`prime_count`, `fibonacci`, and `hash` while heartbeating, report real results,
+and take the next job. See [built-in tasks](docs/tasks.md) for inputs and examples.
 
 ## Build and run
 
-Requirements: Make and a C11 compiler such as Clang or GCC. The project targets
+Requirements: Make, POSIX threads, and a C11 compiler such as Clang or GCC. The project targets
 macOS and Linux. Sanitizer builds also require the compiler's AddressSanitizer
 and UndefinedBehaviorSanitizer runtimes. The integration tests require Python 3
 (standard library only).
@@ -117,22 +118,28 @@ Sanitizer builds stop on detected undefined behavior. Normal and sanitizer
 outputs live in separate directories. Use `make clean` to remove both; also
 clean before changing compilers or flags within the same build configuration.
 
-## Submit and schedule jobs
+## Submit and execute jobs
 
 With the coordinator running, submit jobs before or after starting workers:
 
 ```sh
-./build/debug/faultline submit hash --args "hello" --max-retries 1
+./build/debug/faultline submit sleep --args 1000 --max-retries 1
 # job_id=1
-./build/debug/faultline submit hash --args-hex 00aaff
+./build/debug/faultline submit prime_count --args 100
 # job_id=2
+./build/debug/faultline submit fibonacci --args 10
+# job_id=3
+./build/debug/faultline submit hash --args hello
+# job_id=4
 ```
 
 The coordinator queues jobs until an idle worker is available, then assigns them
-in FIFO order. Each real worker accepts one job and logs `execution=pending`
-while continuing heartbeats. Executors are not implemented yet, so a held job
-remains ASSIGNED. Controlled peers in the tests send execution reports to verify
-completion, worker reuse, and retries. CLI result/status queries are still pending.
+in FIFO order. Each worker executes one job at a time while continuing heartbeats.
+Jobs move through ASSIGNED, RUNNING, and DONE. The coordinator stores and logs
+results: the examples above produce `slept_ms=1000`, `25`, `55`, and
+`a430d84680aabd0b`. Invalid task inputs report failure and follow the retry policy.
+The CLI prints an acceptance ID; result/status queries are still pending.
+See [task arguments, algorithms, and execution](docs/tasks.md).
 
 Arguments are passed through as text or hex-decoded bytes, up to 1024 bytes.
 Retry allowance defaults to zero. The store retains 256 total jobs, including
@@ -151,6 +158,7 @@ Both commands build and run C unit tests and Python integration tests against
 the real executables. `test-sanitize` instruments all C programs under test.
 Use `make test-unit` or `make test-integration` to run either layer separately.
 Use `make test-scheduling` for CLI submission and scheduling scenarios.
+Use `make test-execution` for task results, concurrent workers, and cancellation.
 Use `make test-failures` to run only the five failure-detection scenarios, or
 `make SANITIZE=1 test-failures` to run them with AddressSanitizer/UBSan.
 

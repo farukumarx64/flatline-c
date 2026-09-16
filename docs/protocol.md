@@ -14,7 +14,8 @@ Job submission, acknowledgment, assignment, started, completed, and failed
 messages are also defined and tested in the shared codec. CLI submission,
 coordinator scheduling/report handlers, and worker assignment reception now use
 them; see the [job message specification](job-protocol.md) and
-[scheduling guide](scheduling.md). Actual task executors remain future work.
+[scheduling guide](scheduling.md). Workers execute the [built-in tasks](tasks.md)
+and send actual start, result, or failure reports.
 
 ## Header layout
 

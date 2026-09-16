@@ -18,8 +18,9 @@ holds pending IDs in insertion order independently of full job records. The
 [job message codec](job-protocol.md) defines submission, acknowledgment, assignment,
 started, completed, and failed payloads. [CLI submission and scheduling](scheduling.md)
 now connect the job store and FIFO to live dispatch, validate reports, and apply
-bounded retries on failure or worker loss. Real workers hold one assignment while
-heartbeating. Task execution, result queries, leases, and recovery remain future work.
+bounded retries on failure or worker loss. Workers now execute all four
+[built-in tasks](tasks.md) and report results while heartbeating. Result queries,
+independent execution leases, and persistent recovery remain future work.
 
 ## Components and ownership
 
@@ -102,8 +103,9 @@ Coordinator transport buffers now fit 1062-byte frames. Runtime handlers accept
 submissions and worker reports, and workers receive assignments with partial-frame
 buffering while keeping heartbeats active.
 
-Before job execution and persistence are implemented, resolve how workers keep
-sending heartbeats during long computations, how job/attempt IDs and retry
+Workers use one task pthread while the main thread owns the socket and heartbeats.
+Atomic completion/cancellation flags coordinate the two threads; shutdown joins
+active work. Before persistence, resolve how job/attempt IDs and retry
 counters are preserved across restarts, and how WAL writes,
 acknowledgments, and incomplete trailing records are handled.
 

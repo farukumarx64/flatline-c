@@ -7,10 +7,12 @@ make test
 make test-sanitize
 ```
 
-These run protocol, registry, job, queue, and socket unit tests written in C plus process integration
+These run 66 protocol, registry, job, queue, scheduler, task, and socket C test groups plus process integration
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
+Use `make test-execution` for built-in results, heartbeats during computation,
+worker reuse, and cancellation, or `make SANITIZE=1 test-execution` for instrumented binaries.
 Use `make test-scheduling` for CLI submission and scheduling, or
 `make SANITIZE=1 test-scheduling` for instrumented binaries.
 Use `make test-failures` for the dedicated failure-detection suite, or
@@ -70,7 +72,7 @@ test, source line, and expression. Its checks remain active with `NDEBUG` set.
   reassignment to the same worker under a newer attempt number.
 
 Rejected codec calls preserve all output bytes and written/consumed counts.
-These are buffer/model tests; live job execution is not implemented. The new
+These are buffer/model tests; separate process tests cover live execution. The
 binary also links the job model for the final identity check.
 
 `test_net.c` has six socket test groups and two parsing groups. Socket
@@ -120,7 +122,7 @@ Stale IDs cannot update or kill its replacement worker. Churn exceeds the
 
 These tests need no sockets or sleeps. They verify model-level transitions only;
 runtime submission and retries are now covered by the scheduler tests below.
-Built-in executors remain future work. The job model links into the coordinator and the job/queue/job-message/scheduler test
+The job model links into the coordinator and the job/queue/job-message/scheduler test
 binaries; the CLI and worker do not link its transition implementation.
 
 `test_job_queue.c` adds seven FIFO test groups:
@@ -170,8 +172,43 @@ test to isolate retained job records:
 - CLI option validation and malformed/truncated/zero-ID ACK rejection.
 - A single five-second CLI ACK deadline across header and payload.
 
-Controlled peers produce execution reports; real worker executors remain pending.
+Controlled peers exercise arbitrary reports; real workers now execute long sleep
+tasks in the busy-worker scenarios.
 The scheduler links only into the coordinator and its test binary.
+
+`test_tasks.c` adds seven executor groups:
+
+- Sleep returns the requested milliseconds and waits until its monotonic deadline.
+- Known inclusive prime counts, including 1,000,000 producing 78,498.
+- Fibonacci base cases, F(92), and the largest supported value F(93).
+- Known FNV-1a vectors, empty input, and embedded zero bytes.
+- Bad numeric syntax, per-task limits, overflow, null pointers, oversized data,
+  and unchanged output after rejected calls.
+- Pre-cancelled calls for all four tasks.
+- Running sleep and prime-count tasks stop cooperatively after atomic cancellation.
+
+The task implementation links only into the worker and its executor test binary.
+Those binaries link POSIX threads; the coordinator remains single-threaded.
+
+`integration/test_execution.py` adds 11 scenarios against fresh coordinators:
+
+- Sleep completes and releases its worker for the next FIFO job.
+- CLI submissions execute all four tasks and expose expected coordinator results.
+- A controlled peer verifies literal STARTED/COMPLETED reports, maximum binary
+  input, fragmented assignments, maximum IDs, and a 64-bit attempt number.
+- Invalid task arguments fail while the worker remains available.
+- Failed attempts retry at the queue tail and eventually exhaust their budget.
+- CPU work keeps heartbeats active and stops promptly when cancelled.
+- Two workers execute concurrently and drain queued work.
+- An interrupted sleep is retried and completed by a replacement worker.
+- Coordinator disconnect, SIGINT, and SIGTERM cancel long sleep and CPU tasks.
+- Literal FAILED reports contain the TASK reason and do not prevent later success.
+- Binary results are escaped in the coordinator log without changing raw bytes.
+
+These tests use a 500 ms heartbeat timeout and 60–80 ms worker intervals. Sleep
+and CPU tasks remain active beyond that timeout, so continuing heartbeats are
+required to keep their assignments alive. Algorithm/input contracts are in
+[the task guide](../docs/tasks.md).
 
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
 Its original 15 scenarios cover a successful exchange and sequential clients, default
@@ -292,6 +329,5 @@ make test-sanitize INTEGRATION_ARGS='--port 9000'
 When 9000 is selected, the harness starts the coordinator without `--port` and
 also invokes `faultline ping` and `faultline-worker` without `--coordinator`
 to test all defaults. Processes started by the harness are stopped afterward.
-The coordinator, CLI, and worker
-are not yet tested for job execution or persistent recovery;
-those features will add their own integration scenarios.
+With automatic port selection, the suite discovers 71 scenarios: 69 run and two
+default-port checks are skipped. Persistent recovery is not implemented or tested yet.

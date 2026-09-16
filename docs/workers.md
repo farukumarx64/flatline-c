@@ -10,8 +10,8 @@ The worker executable connects and registers, reads its assigned ID from
 the acknowledgment, and sends periodic heartbeats. The coordinator expires
 registrations that miss their heartbeat deadline. The [scheduler](scheduling.md)
 now assigns queued jobs to idle workers and retries interrupted assignments.
-Workers retain one assignment while heartbeating; executors and persistent
-recovery remain future work. Integration tests cover both real workers
+Workers execute one [built-in task](tasks.md) while heartbeating and report its
+result or failure. Persistent recovery remains future work. Integration tests cover both real workers
 and controlled peers.
 
 ## Run two workers
@@ -69,8 +69,9 @@ five-second budget.
 SIGINT/SIGTERM interrupt the ACK or heartbeat wait promptly; connect/send may finish
 their bounded operation first. A local stop exits successfully. Coordinator
 disconnection, invalid ACKs, or unexpected data after registration exit with
-failure. Valid JOB_ASSIGN frames are now received and retained while heartbeats
-continue. Execution and automatic reconnect remain future work.
+failure. Valid JOB_ASSIGN frames start a task thread while heartbeats continue.
+Results and failures are reported over the same connection. All shutdown paths
+cancel and join active work. Automatic reconnect remains future work.
 Its retained ID applies only to this connection.
 
 ## Heartbeat interval and timeout
@@ -103,7 +104,7 @@ allowing for network and scheduling delays. A worker whose interval exceeds the
 coordinator's timeout can expire before its first heartbeat. Very small positive
 values are accepted for experiments; they do not promise real-time scheduling.
 
-After validating the complete registration ACK, `run_heartbeats()` encodes one
+After validating the complete registration ACK, `worker_loop()` encodes one
 16-byte frame: the existing 12-byte HEARTBEAT header and its four-byte assigned ID,
 all in big-endian order. The frame is reused because the ID does not change on
 this connection. No timestamp or heartbeat acknowledgment is added to the protocol.
@@ -119,7 +120,9 @@ ends the worker connection. After local send completion, the next deadline is
 the current monotonic time plus the interval. This avoids catch-up bursts after
 a pause or delayed send. Connect, registration send, and each heartbeat send
 retain the existing five-second operation budget; these bounded helpers may
-finish before a pending local stop is honored. No new thread is created.
+finish before a pending local stop is honored. Heartbeats stay on the main
+thread; a separate task pthread handles computation. While busy, the main loop
+also checks completion at most every 50 ms.
 
 The coordinator uses the following rule for every ALIVE worker:
 
@@ -155,7 +158,8 @@ remain, or mark FAILED when they are exhausted.
 A timeout means the coordinator considers this registration unavailable. It does
 not prove the process crashed: a pause, network delay, or overloaded machine can
 produce the same observation. Attempt identity prevents a late report from
-updating a newer assignment; future executors must account for possible overlap.
+updating a newer assignment. Built-in tasks are safe to repeat; workers cancel
+active computation once connection loss is detected, but attempts can overlap.
 
 ## Verify failure detection
 

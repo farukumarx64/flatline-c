@@ -8,8 +8,8 @@ bytes. No C struct, enum representation, pointer, or `size_t` is sent directly.
 Encoding, decoding, validation, and runtime submission/assignment/report handlers
 are implemented. The CLI can submit jobs; the coordinator stores and schedules
 them using the [job model](jobs.md) and [FIFO queue](queue.md). Workers receive
-and retain assignments while heartbeating. Actual task executors and real-worker
-execution reports are still pending; controlled peers exercise report handling.
+and execute assignments while heartbeating, then send real execution reports.
+The [task guide](tasks.md) defines numeric inputs and result formats.
 See [scheduling.md](scheduling.md) for runtime behavior and limits.
 
 ## Message overview
@@ -47,9 +47,9 @@ Offsets in all following tables are relative to the payload, after the header.
 | 10 | `argument_length` | Argument bytes |
 
 Task IDs are SLEEP=1, PRIME_COUNT=2, FIBONACCI=3, and HASH=4, shared with the job
-model. Zero and unknown task types are invalid. Task-specific argument/result
-schemas, numeric ranges, and executor implementations remain future work. The
-codec does not yet interpret a sleep duration, Fibonacci input, or hash algorithm.
+model. Zero and unknown task types are invalid. [Built-in executors](tasks.md)
+define task-specific schemas, ranges, and algorithms. The codec preserves opaque
+bytes; workers interpret and validate their task arguments.
 Byte counts are not string lengths: embedded zero bytes are preserved, and no
 terminating NUL is appended or required.
 
@@ -161,7 +161,8 @@ CLI                Coordinator                         Worker 7
 A failed attempt sends FAILED instead of COMPLETED; STARTED may be absent when
 the task cannot begin. Heartbeats continue independently of these messages.
 There is no additional ACK for STARTED, COMPLETED, or FAILED in this format.
-Keeping heartbeats running during computation is a future worker requirement.
+The worker main thread keeps heartbeats running while a separate task thread
+computes. Only the main thread sends frames, preserving message boundaries.
 
 A complete `JOB_STARTED` frame for job 42, worker 7, attempt 1 is:
 

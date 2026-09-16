@@ -34,10 +34,10 @@ A source buffer must not overlap the destination job record.
 
 This is an initial bounded representation for the MVP, separate from the generic
 protocol header's 1 MiB payload ceiling. Task-specific argument/result schemas
-and validation belong to the upcoming executors. The [job message codec](job-protocol.md)
+and validation belong to the [worker executors](tasks.md). The [job message codec](job-protocol.md)
 now encodes task IDs, bounded opaque data, and assignment/report identity. The model checks
 the known task type and byte limits, but does not interpret a sleep duration, hash
-input, or numeric computation limit yet.
+input, or numeric computation limit.
 
 All numeric fields are host-order values. Neither this struct nor its arrays of
 metadata constitute a wire format or WAL record. Job messages encode selected
@@ -172,8 +172,8 @@ monotonic values with a new machine or clock origin.
 
 ## Example and tests
 
-This illustrates model calls only; the bytes are arbitrary sample arguments and
-do not define the future sleep-task wire format. Check return codes at each step:
+This illustrates model calls with the ASCII argument `1000`, meaning a one-second
+sleep. No executor runs in this snippet. Check return codes at each step:
 
 ```c
 #include "job.h"
@@ -182,7 +182,7 @@ do not define the future sleep-task wire format. Check return codes at each step
 int main(void)
 {
     struct faultline_job job;
-    const uint8_t arguments[] = {0x00, 0x00, 0x03, 0xe8};
+    const uint8_t arguments[] = {'1', '0', '0', '0'};
 
     if (faultline_job_init(&job, 42, FAULTLINE_TASK_SLEEP,
                            arguments, sizeof(arguments), 2, 100) != FAULTLINE_JOB_OK) {
