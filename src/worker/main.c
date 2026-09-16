@@ -133,13 +133,17 @@ static int receive_registration_ack(int fd, uint32_t *worker_id)
     return 0;
 }
 
-static int run_heartbeats(int fd, uint32_t worker_id, int interval_ms)
+static int run_worker(int fd, uint32_t worker_id, int interval_ms)
 {
     const struct faultline_message heartbeat = {
         .message_type = FAULTLINE_MSG_HEARTBEAT, .payload.worker_id = worker_id
     };
     uint8_t wire[FAULTLINE_HEADER_SIZE + FAULTLINE_HEARTBEAT_PAYLOAD_SIZE];
     size_t written;
+    uint8_t input[FAULTLINE_MESSAGE_MAX_FRAME_SIZE];
+    size_t received = 0, expected = FAULTLINE_HEADER_SIZE;
+    int64_t frame_started = -1;
+    struct faultline_job_assign_payload active = {0};
     int64_t now = faultline_monotonic_ms();
     int64_t next_heartbeat;
 
@@ -154,45 +158,79 @@ static int run_heartbeats(int fd, uint32_t worker_id, int interval_ms)
     }
     next_heartbeat = now + interval_ms;
     while (!stopping) {
-        int ready = wait_for_input(fd, next_heartbeat);
-        uint8_t byte;
-        ssize_t count;
-
-        if (ready == WAIT_STOP) {
-            break;
+        int64_t deadline = next_heartbeat;
+        if (frame_started >= 0 && frame_started + FAULTLINE_IO_TIMEOUT_MS < deadline) {
+            deadline = frame_started + FAULTLINE_IO_TIMEOUT_MS;
         }
+        int ready = wait_for_input(fd, deadline);
+        if (ready == WAIT_STOP) { break; }
         if (ready == WAIT_ERROR) {
             perror("worker: wait for coordinator");
             return EXIT_FAILURE;
         }
-        if (ready == WAIT_DEADLINE) {
+        now = faultline_monotonic_ms();
+        if (now < 0) { perror("worker: clock"); return EXIT_FAILURE; }
+        if (frame_started >= 0 && now - frame_started >= FAULTLINE_IO_TIMEOUT_MS) {
+            fputs("worker: assignment receive timeout\n", stderr);
+            return EXIT_FAILURE;
+        }
+        /* Input traffic and partial assignments never postpone heartbeats. */
+        if (now >= next_heartbeat) {
             if (faultline_send_all(fd, wire, written, FAULTLINE_IO_TIMEOUT_MS) < 0) {
                 perror("worker: send heartbeat");
                 return EXIT_FAILURE;
             }
             now = faultline_monotonic_ms();
-            if (now < 0) {
-                perror("worker: clock");
-                return EXIT_FAILURE;
-            }
+            if (now < 0) { perror("worker: clock"); return EXIT_FAILURE; }
             printf("[INFO] worker heartbeat_sent worker_id=%" PRIu32 "\n", worker_id);
-            /* Schedule from completion; a delayed worker never sends a catch-up burst. */
             next_heartbeat = now + interval_ms;
             continue;
         }
-        count = recv(fd, &byte, 1, 0);
-        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (ready != WAIT_INPUT) { continue; }
+        ssize_t count = recv(fd, input + received, expected - received, 0);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) { continue; }
+        if (count <= 0) {
+            if (count < 0) { perror("worker: coordinator connection"); }
+            else { fputs("worker: coordinator disconnected\n", stderr); }
+            return EXIT_FAILURE;
+        }
+        if (received == 0) { frame_started = now; }
+        received += (size_t)count;
+        const uint8_t prefix[] = {0x46, 0x4c, 0x49, 0x4e, 0, 1};
+        size_t prefix_size = received < sizeof(prefix) ? received : sizeof(prefix);
+        if (memcmp(input, prefix, prefix_size) != 0) {
+            fputs("worker: unexpected data after registration\n", stderr);
+            return EXIT_FAILURE;
+        }
+        if (received < expected) { continue; }
+        if (received == FAULTLINE_HEADER_SIZE) {
+            struct faultline_header header;
+            if (faultline_header_decode(input, received, &header) != FAULTLINE_PROTOCOL_OK ||
+                header.message_type != FAULTLINE_MSG_JOB_ASSIGN ||
+                header.payload_length < FAULTLINE_JOB_ASSIGN_PREFIX_SIZE ||
+                header.payload_length > sizeof(input) - FAULTLINE_HEADER_SIZE) {
+                fputs("worker: unexpected data after registration; expected job assignment\n", stderr);
+                return EXIT_FAILURE;
+            }
+            expected = FAULTLINE_HEADER_SIZE + (size_t)header.payload_length;
             continue;
         }
-        if (count < 0) {
-            perror("worker: coordinator connection");
-        } else if (count == 0) {
-            fputs("worker: coordinator disconnected\n", stderr);
-        } else {
-            /* Job handlers are not implemented yet; do not silently discard data. */
-            fputs("worker: unexpected data after registration\n", stderr);
+        struct faultline_message message;
+        size_t consumed;
+        if (faultline_message_decode(input, received, &message, &consumed) != FAULTLINE_PROTOCOL_OK ||
+            message.payload.job_assign.identity.worker_id != worker_id || active.identity.job_id != 0) {
+            fputs("worker: invalid assignment or worker already busy\n", stderr);
+            return EXIT_FAILURE;
         }
-        return EXIT_FAILURE;
+        active = message.payload.job_assign;
+        printf("[INFO] worker job_assigned job_id=%" PRIu64 " worker_id=%" PRIu32
+               " attempt=%" PRIu64 " task_type=%u argument_bytes=%zu execution=pending\n",
+               active.identity.job_id, worker_id, active.identity.attempt,
+               (unsigned int)active.task_type, active.argument_size);
+        /* Keep ownership and heartbeats until task executors can process active. */
+        received = 0;
+        expected = FAULTLINE_HEADER_SIZE;
+        frame_started = -1;
     }
     return EXIT_SUCCESS;
 }
@@ -264,7 +302,7 @@ int main(int argc, char **argv)
     printf("[INFO] worker registered worker_id=%" PRIu32
            " coordinator=%s:%u heartbeat_interval_ms=%d\n",
            worker_id, host, (unsigned int)port, interval_ms);
-    status = run_heartbeats(fd, worker_id, interval_ms);
+    status = run_worker(fd, worker_id, interval_ms);
 
 done:
     (void)close(fd);
