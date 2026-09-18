@@ -156,8 +156,9 @@ log `task_status=ok`. Local cancellation is not sent as a failure during shutdow
 The current failure payload has no detailed error text.
 
 SIGKILL bypasses the worker's cleanup entirely. The separate
-[hard-crash recovery check](recovery.md) verifies that the coordinator requeues
-the interrupted task and an already-connected worker completes it.
+[worker recovery checks](recovery.md) verify that the coordinator requeues an
+interrupted task and an already-connected worker completes it. They cover both
+SIGKILL and a busy worker paused with SIGSTOP until its heartbeat expires.
 
 The coordinator applies its existing retry budget. With `--max-retries 1`, an
 invalid argument is tried twice and then becomes FAILED; retries do not fix

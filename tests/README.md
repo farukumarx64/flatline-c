@@ -11,8 +11,8 @@ These run 66 protocol, registry, job, queue, scheduler, task, and socket C test 
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
-Use `make test-recovery` for SIGKILL recovery of a running job onto an already-connected
-worker, or `make SANITIZE=1 test-recovery` for the same check with instrumented binaries.
+Use `make test-recovery` for SIGKILL and SIGSTOP/heartbeat recovery of running jobs
+onto already-connected workers, or `make SANITIZE=1 test-recovery` for instrumented binaries.
 Use `make test-execution` for built-in results, heartbeats during computation,
 worker reuse, and cancellation, or `make SANITIZE=1 test-execution` for instrumented binaries.
 Use `make test-scheduling` for CLI submission and scheduling, or
@@ -212,8 +212,8 @@ and CPU tasks remain active beyond that timeout, so continuing heartbeats are
 required to keep their assignments alive. Algorithm/input contracts are in
 [the task guide](../docs/tasks.md).
 
-`integration/test_recovery.py` adds one hard-crash acceptance scenario with a
-fresh coordinator and two real workers. Both workers register and heartbeat
+`integration/test_recovery.py` contains two acceptance scenarios, each with a
+fresh coordinator and two real workers. In the hard-crash check, both register and heartbeat
 before CLI submission. After a three-second sleep job starts and its owner sends
 another heartbeat, the harness kills that owner with SIGKILL. It verifies prompt
 transport-based detection, one requeue, the same job ID assigned to the connected
@@ -225,6 +225,21 @@ events, and the survivor keeps its original registration. The coordinator uses
 its default six-second heartbeat timeout; attempt 2 must start within 2.5 seconds
 of the kill. This is distinct from the existing graceful SIGTERM retry scenario
 and idle-worker failure detection. See [the recovery guide](../docs/recovery.md).
+
+The heartbeat recovery check uses SIGSTOP on the busy worker and confirms the
+OS stopped state with `waitpid(WUNTRACED | WNOHANG)`. Before expiry, it verifies
+that the worker remains present, its job remains RUNNING, and there is no timeout
+or reassignment. The other worker and CLI remain responsive. Exactly one
+heartbeat timeout and worker death must then occur, with at least 6000 ms and
+less than 7500 ms of silence measured from the last accepted heartbeat.
+The test checks timeout/death descriptor and timestamp consistency.
+
+The connected survivor completes attempt 2 with the expected result, then a new
+Fibonacci job. The original worker remains paused through both completions and
+sends no terminal report. A finally block kills and reaps that child after the
+checks or on failure; this cleanup cannot trigger a passing recovery. The test
+does not resume the old attempt. Both scenarios share log parsing, bounded
+attempt-aware waits, and exact transition-sequence assertions in `RecoveryTestCase`.
 
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
 Its original 15 scenarios cover a successful exchange and sequential clients, default
@@ -345,5 +360,5 @@ make test-sanitize INTEGRATION_ARGS='--port 9000'
 When 9000 is selected, the harness starts the coordinator without `--port` and
 also invokes `faultline ping` and `faultline-worker` without `--coordinator`
 to test all defaults. Processes started by the harness are stopped afterward.
-With automatic port selection, the suite discovers 72 scenarios: 70 run and two
+With automatic port selection, the suite discovers 73 scenarios: 71 run and two
 default-port checks are skipped. Persistent recovery is not implemented or tested yet.
