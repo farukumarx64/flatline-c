@@ -1,6 +1,7 @@
 """Recover real running jobs after worker failure, using the real CLI and workers."""
 
 import argparse
+import os
 from pathlib import Path
 import re
 import signal
@@ -12,9 +13,7 @@ from test_scheduling import JobProcessTestCase
 from test_worker import read_output
 
 
-class HardCrashRecoveryTests(JobProcessTestCase):
-    # Keep the six-second default so prompt disconnect detection cannot be
-    # mistaken for an accelerated heartbeat timeout.
+class RecoveryTestCase(JobProcessTestCase):
     def job_events(self, job_id):
         events = []
         for line in read_output(self.log).splitlines(keepends=True):
@@ -47,6 +46,39 @@ class HardCrashRecoveryTests(JobProcessTestCase):
             self.assertLess(time.monotonic(), deadline, read_output(self.log))
             time.sleep(0.01)
 
+    def assert_recovery_transitions(self, job_id, owner_id, survivor_id):
+        transitions = [(entry['event'], entry['state'], entry['worker_id'],
+                        entry['attempt'], entry['retry_count'])
+                       for entry in self.job_events(job_id)]
+        self.assertEqual(transitions, [
+            ('job_submitted', 'QUEUED', '0', '0', '0'),
+            ('job_assigned', 'ASSIGNED', str(owner_id), '1', '0'),
+            ('job_started', 'RUNNING', str(owner_id), '1', '0'),
+            ('job_worker_lost', 'QUEUED', '0', '1', '1'),
+            ('job_assigned', 'ASSIGNED', str(survivor_id), '2', '1'),
+            ('job_started', 'RUNNING', str(survivor_id), '2', '1'),
+            ('job_completed', 'DONE', str(survivor_id), '2', '1'),
+        ])
+
+    def pause_worker(self, process):
+        process.send_signal(signal.SIGSTOP)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            child, status = os.waitpid(process.pid, os.WUNTRACED | os.WNOHANG)
+            if child:
+                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                    # Preserve an unexpected terminal status already consumed by waitpid.
+                    process.returncode = os.waitstatus_to_exitcode(status)
+                self.assertTrue(os.WIFSTOPPED(status), 'Worker exited instead of stopping')
+                self.assertEqual(os.WSTOPSIG(status), signal.SIGSTOP)
+                return
+            time.sleep(0.01)
+        self.fail('Worker did not enter the stopped state after SIGSTOP')
+
+
+class HardCrashRecoveryTests(RecoveryTestCase):
+    # Keep the six-second default so prompt disconnect detection cannot be
+    # mistaken for an accelerated heartbeat timeout.
     def test_sigkill_busy_worker_recovers_on_connected_idle_worker(self):
         with self.worker_process(interval_ms=100) as first, \
                 self.worker_process(interval_ms=100) as second:
@@ -109,24 +141,109 @@ class HardCrashRecoveryTests(JobProcessTestCase):
 
             # One job ID, exactly one requeue, two assignments/starts, and one
             # accepted completion: no duplicate or missing transition can pass.
-            transitions = [(entry['event'], entry['state'], entry['worker_id'],
-                            entry['attempt'], entry['retry_count'])
-                           for entry in self.job_events(job_id)]
-            self.assertEqual(transitions, [
-                ('job_submitted', 'QUEUED', '0', '0', '0'),
-                ('job_assigned', 'ASSIGNED', str(owner_id), '1', '0'),
-                ('job_started', 'RUNNING', str(owner_id), '1', '0'),
-                ('job_worker_lost', 'QUEUED', '0', '1', '1'),
-                ('job_assigned', 'ASSIGNED', str(survivor_id), '2', '1'),
-                ('job_started', 'RUNNING', str(survivor_id), '2', '1'),
-                ('job_completed', 'DONE', str(survivor_id), '2', '1'),
-            ])
+            self.assert_recovery_transitions(job_id, owner_id, survivor_id)
             self.assertEqual(len(self.worker_events('worker_dead', owner_id)), 1)
             self.assertEqual(self.worker_events('worker_dead', survivor_id), [])
             self.assert_pong(self.run_cli())
             print(f'job {job_id}: SIGKILL worker {owner_id}; connected worker {survivor_id} '
                   f'started attempt 2 within {recovery_seconds:.3f}s; '
                   f'result=slept_ms=3000; follow-up job {followup}=55', flush=True)
+            self.stop_worker(survivor, survivor_errors)
+
+
+class HeartbeatRecoveryTests(RecoveryTestCase):
+    def test_paused_busy_worker_expires_and_connected_worker_completes(self):
+        with self.worker_process(interval_ms=100) as first, \
+                self.worker_process(interval_ms=100) as second:
+            workers = {}
+            for process, output, errors in (first, second):
+                worker_id = self.wait_for_registration(process, output, errors)
+                self.wait_for_worker_event('heartbeat_received', worker_id)
+                workers[worker_id] = (process, output, errors)
+            self.assertEqual(len(workers), 2)
+            job_id = self.accepted_id(self.submit_cli('sleep', '--args', '3000',
+                                                      '--max-retries', '1'))
+            started = self.wait_transition(job_id, 'job_started', state='RUNNING',
+                                           attempt=1, retry_count=0)
+            owner_id = int(started['worker_id'])
+            owner, owner_output, owner_errors = workers[owner_id]
+            survivor_id, = workers.keys() - {owner_id}
+            survivor, survivor_output, survivor_errors = workers[survivor_id]
+            self.assertNotIn('worker job_assigned', read_output(survivor_output))
+            self.wait_next_heartbeat(owner_id, owner)
+
+            # Keep this worker stopped through recovery and completion. No close,
+            # shutdown, exit, or SIGCONT is used to trigger reassignment.
+            try:
+                self.pause_worker(owner)
+                self.assertFalse(any(entry['event'] == 'job_completed'
+                                     for entry in self.job_events(job_id)))
+                before_expiry = time.monotonic() + 0.3
+                while time.monotonic() < before_expiry:
+                    self.assertIsNone(owner.poll(), 'Paused worker exited')
+                    self.assertEqual(self.worker_events('worker_dead', owner_id), [])
+                    self.assertEqual(self.worker_events('heartbeat_timeout', owner_id), [])
+                    events = self.job_events(job_id)
+                    self.assertEqual([entry['event'] for entry in events],
+                                     ['job_submitted', 'job_assigned', 'job_started'])
+                    self.assertEqual(events[-1]['state'], 'RUNNING')
+                    time.sleep(0.01)
+                # The coordinator and healthy worker still make progress while
+                # the paused worker's registration and assignment remain alive.
+                self.wait_next_heartbeat(survivor_id, survivor)
+                self.assert_pong(self.run_cli())
+
+                self.wait_transition(job_id, 'job_worker_lost', timeout=8, state='QUEUED',
+                                     worker_id=0, attempt=1, retry_count=1, pending=1)
+                dead = self.wait_for_worker_event('worker_dead', owner_id)
+                timeouts = self.worker_events('heartbeat_timeout', owner_id)
+                self.assertEqual(len(timeouts), 1)
+                expired = timeouts[0]
+                self.assertEqual(dead['state'], 'DEAD')
+                self.assertEqual(dead['reason'], 'heartbeat_timeout')
+                self.assertEqual(expired['fd'], dead['fd'])
+                self.assertEqual(int(expired['timeout_ms']), 6000)
+                silence_ms = int(expired['silence_ms'])
+                self.assertEqual(silence_ms, int(expired['detected_at_ms']) -
+                                 int(dead['last_heartbeat_ms']))
+                self.assertGreaterEqual(silence_ms, 6000)
+                self.assertLess(silence_ms, 7500)  # Allow local scheduling slack.
+                latest = self.worker_events('heartbeat_received', owner_id)[-1]
+                self.assertEqual(latest['last_heartbeat_ms'], dead['last_heartbeat_ms'])
+                self.assertIsNone(owner.poll(), 'Expiry must occur while the owner is still stopped')
+
+                self.wait_transition(job_id, 'job_started', state='RUNNING',
+                                     worker_id=survivor_id, attempt=2, retry_count=1)
+                self.wait_transition(job_id, 'job_completed', timeout=6, state='DONE',
+                                     worker_id=survivor_id, attempt=2, retry_count=1,
+                                     pending=0, result_bytes=13, result='"slept_ms=3000"')
+                followup = self.accepted_id(self.submit_cli('fibonacci', '--args', '10'))
+                self.assertNotEqual(followup, job_id)
+                self.wait_transition(followup, 'job_completed', state='DONE',
+                                     worker_id=survivor_id, attempt=1, retry_count=0,
+                                     pending=0, result_bytes=2, result='"55"')
+                self.wait_next_heartbeat(survivor_id, survivor)
+                self.assert_pong(self.run_cli())
+
+                self.assert_recovery_transitions(job_id, owner_id, survivor_id)
+                self.assertEqual(len(self.worker_events('worker_dead', owner_id)), 1)
+                self.assertEqual(self.worker_events('worker_dead', survivor_id), [])
+                self.assertEqual(len(self.worker_events('worker_registered', survivor_id)), 1)
+                self.assertIsNone(survivor.poll())
+                self.assertIsNone(owner.poll(), 'Original worker must stay paused through completion')
+                self.assertEqual(read_output(owner_errors), '')
+                self.assertNotIn('job_completed_sent', read_output(owner_output))
+                self.assertNotIn('job_failed_sent', read_output(owner_output))
+                print(f'job {job_id}: SIGSTOP worker {owner_id}; heartbeat_timeout after '
+                      f'{silence_ms}ms of silence; connected worker {survivor_id} completed '
+                      f'attempt 2, result=slept_ms=3000; follow-up job {followup}=55', flush=True)
+            finally:
+                # SIGTERM cannot be handled by a stopped process. Kill only this
+                # test-owned child after assertions, or on failure, to guarantee cleanup.
+                # Resuming an old attempt is deliberately a separate acceptance scenario.
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=2)
             self.stop_worker(survivor, survivor_errors)
 
 
