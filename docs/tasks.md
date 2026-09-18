@@ -155,6 +155,10 @@ TASK reason. The worker remains usable. Its `job_failed_sent` log includes
 log `task_status=ok`. Local cancellation is not sent as a failure during shutdown.
 The current failure payload has no detailed error text.
 
+SIGKILL bypasses the worker's cleanup entirely. The separate
+[hard-crash recovery check](recovery.md) verifies that the coordinator requeues
+the interrupted task and an already-connected worker completes it.
+
 The coordinator applies its existing retry budget. With `--max-retries 1`, an
 invalid argument is tried twice and then becomes FAILED; retries do not fix
 invalid input. Retried jobs join the FIFO's back. Every attempt reports the

@@ -163,6 +163,10 @@ active computation once connection loss is detected, but attempts can overlap.
 
 ## Verify failure detection
 
+For a busy worker killed with SIGKILL and its job completed by another connected
+worker, run `make test-recovery`; see [worker crash recovery](recovery.md).
+The detection scenarios below focus on registration/connection liveness.
+
 Failure detection has two inputs: a socket reporting disconnection and a worker
 missing its heartbeat deadline. Both mark the registration DEAD and close its
 connection through the same coordinator cleanup path.

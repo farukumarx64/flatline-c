@@ -147,6 +147,10 @@ terminal records; full stores reject further submissions, and restarting loses
 all in-memory jobs. See [the scheduling guide](docs/scheduling.md) for CLI options,
 acceptance guarantees, worker eligibility, retries, and the current limits.
 
+A [hard-crash recovery check](docs/recovery.md) kills a busy worker with SIGKILL
+and verifies that an already-connected worker completes the same job on attempt 2,
+then remains available for another job.
+
 ## Tests
 
 ```sh
@@ -159,6 +163,8 @@ the real executables. `test-sanitize` instruments all C programs under test.
 Use `make test-unit` or `make test-integration` to run either layer separately.
 Use `make test-scheduling` for CLI submission and scheduling scenarios.
 Use `make test-execution` for task results, concurrent workers, and cancellation.
+Use `make test-recovery` for hard-crash recovery of a running job, or
+`make SANITIZE=1 test-recovery` for the sanitizer build.
 Use `make test-failures` to run only the five failure-detection scenarios, or
 `make SANITIZE=1 test-failures` to run them with AddressSanitizer/UBSan.
 
