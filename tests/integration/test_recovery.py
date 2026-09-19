@@ -247,6 +247,96 @@ class HeartbeatRecoveryTests(RecoveryTestCase):
             self.stop_worker(survivor, survivor_errors)
 
 
+class OldAttemptRecoveryTests(RecoveryTestCase):
+    def check_resumed_worker(self, resume_after_completion):
+        with self.worker_process(interval_ms=100) as first, \
+                self.worker_process(interval_ms=100) as second:
+            workers = {}
+            for process, output, errors in (first, second):
+                worker_id = self.wait_for_registration(process, output, errors)
+                self.wait_for_worker_event('heartbeat_received', worker_id)
+                workers[worker_id] = (process, output, errors)
+            self.assertEqual(len(workers), 2)
+            job_id = self.accepted_id(self.submit_cli('sleep', '--args', '3000',
+                                                      '--max-retries', '1'))
+            started = self.wait_transition(job_id, 'job_started', state='RUNNING',
+                                           attempt=1, retry_count=0)
+            owner_id = int(started['worker_id'])
+            owner, owner_output, owner_errors = workers[owner_id]
+            survivor_id, = workers.keys() - {owner_id}
+            survivor, survivor_output, survivor_errors = workers[survivor_id]
+            self.assertNotIn('worker job_assigned', read_output(survivor_output))
+            self.wait_next_heartbeat(owner_id, owner)
+
+            try:
+                self.pause_worker(owner)
+                self.wait_transition(job_id, 'job_worker_lost', timeout=8, state='QUEUED',
+                                     worker_id=0, attempt=1, retry_count=1, pending=1)
+                dead = self.wait_for_worker_event('worker_dead', owner_id)
+                self.assertEqual(dead['reason'], 'heartbeat_timeout')
+                self.wait_transition(job_id, 'job_started', state='RUNNING',
+                                     worker_id=survivor_id, attempt=2, retry_count=1)
+                completed_fields = dict(state='DONE', worker_id=survivor_id, attempt=2,
+                                        retry_count=1, pending=0, result_bytes=13,
+                                        result='"slept_ms=3000"')
+                if resume_after_completion:
+                    self.wait_transition(job_id, 'job_completed', timeout=6, **completed_fields)
+
+                expected_state = 'DONE' if resume_after_completion else 'RUNNING'
+                before_resume = self.job_events(job_id)
+                self.assertEqual(before_resume[-1]['state'], expected_state)
+                self.assertEqual(before_resume[-1]['worker_id'], str(survivor_id))
+                old_heartbeats = self.worker_events('heartbeat_received', owner_id)
+                self.assertIsNone(owner.poll())
+                # Resume the SAME process, with its old socket and attempt-1 assignment.
+                owner.send_signal(signal.SIGCONT)
+                self.assertEqual(owner.wait(timeout=2), 1, read_output(owner_errors))
+                # A real connection error, not SIGTERM/SIGKILL, must end the resumed worker.
+                self.assertRegex(read_output(owner_errors),
+                                 r'worker: (coordinator (disconnected|connection)|send (heartbeat|job report))')
+                self.assertEqual(self.job_events(job_id), before_resume)
+                self.assertEqual(self.worker_events('heartbeat_received', owner_id), old_heartbeats)
+
+                self.wait_transition(job_id, 'job_completed', timeout=6, **completed_fields)
+                completed_events = self.job_events(job_id)
+                followup = self.accepted_id(self.submit_cli('fibonacci', '--args', '10'))
+                self.assertNotEqual(followup, job_id)
+                self.wait_transition(followup, 'job_completed', state='DONE',
+                                     worker_id=survivor_id, attempt=1, retry_count=0,
+                                     pending=0, result_bytes=2, result='"55"')
+                self.wait_next_heartbeat(survivor_id, survivor)
+                self.assert_pong(self.run_cli())
+
+                self.assertEqual(self.job_events(job_id), completed_events)
+                self.assert_recovery_transitions(job_id, owner_id, survivor_id)
+                self.assertEqual(self.worker_events('heartbeat_received', owner_id), old_heartbeats)
+                self.assertEqual(len(self.worker_events('heartbeat_timeout', owner_id)), 1)
+                self.assertEqual(len(self.worker_events('worker_dead', owner_id)), 1)
+                self.assertEqual(len(self.worker_events('worker_registered', owner_id)), 1)
+                self.assertEqual(len(self.worker_events('worker_registered', survivor_id)), 1)
+                self.assertEqual(self.worker_events('worker_dead', survivor_id), [])
+                self.assertIsNone(survivor.poll())
+                # The old socket may accept a local send even after peer closure.
+                # Do not confuse that worker log with acceptance by the coordinator.
+                local_report = 'job_completed_sent' in read_output(owner_output)
+                print(f'job {job_id}: resumed worker {owner_id} while attempt 2 was '
+                      f'{expected_state}; old worker exited on connection error; '
+                      f'old_local_completion_send={local_report}; worker {survivor_id} '
+                      f'result=slept_ms=3000 preserved; follow-up job {followup}=55', flush=True)
+            finally:
+                # Also cleans up a still-stopped child if an earlier assertion fails.
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=2)
+            self.stop_worker(survivor, survivor_errors)
+
+    def test_resumed_worker_cannot_change_running_retry(self):
+        self.check_resumed_worker(resume_after_completion=False)
+
+    def test_resumed_worker_cannot_overwrite_completed_retry(self):
+        self.check_resumed_worker(resume_after_completion=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--bin-dir', type=Path, default=Path('build/debug'))

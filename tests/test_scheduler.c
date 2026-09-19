@@ -125,6 +125,71 @@ static int test_retry_order_and_stale_attempt(void)
     return EXIT_SUCCESS;
 }
 
+static int reject_old_reports(uint64_t job_id, int64_t now_ms)
+{
+    const struct faultline_message reports[] = {
+        {.message_type = FAULTLINE_MSG_JOB_STARTED, .payload.job_started = {job_id, 7, 1}},
+        {.message_type = FAULTLINE_MSG_JOB_COMPLETED,
+         .payload.job_completed = {.identity = {job_id, 7, 1},
+                                  .result_size = 3, .result = {'O', 'L', 'D'}}},
+        {.message_type = FAULTLINE_MSG_JOB_FAILED,
+         .payload.job_failed = {.identity = {job_id, 7, 1}, .failure = FAULTLINE_JOB_FAILURE_TASK}}
+    };
+    memcpy(&before, &scheduler, sizeof(scheduler));
+    for (size_t i = 0; i < sizeof(reports) / sizeof(reports[0]); ++i) {
+        CHECK(faultline_scheduler_report(&scheduler, 7, &reports[i], now_ms) ==
+              FAULTLINE_SCHEDULER_INVALID_JOB);
+        /* Preserve every record, result, timestamp, retry counter, and queue entry. */
+        CHECK(memcmp(&scheduler, &before, sizeof(scheduler)) == 0);
+    }
+    return EXIT_SUCCESS;
+}
+
+static int test_old_reports_preserve_retry_and_result(void)
+{
+    for (uint32_t next_worker = 7; next_worker <= 8; ++next_worker) {
+        uint64_t id;
+        struct faultline_message assignment;
+        faultline_scheduler_init(&scheduler);
+        CHECK(faultline_scheduler_submit(&scheduler, &sample, 10, &id) == FAULTLINE_SCHEDULER_OK);
+        CHECK(faultline_scheduler_assign(&scheduler, 7, 11, &assignment) == FAULTLINE_SCHEDULER_OK);
+        struct faultline_message started = {.message_type = FAULTLINE_MSG_JOB_STARTED,
+                                            .payload.job_started = {id, 7, 1}};
+        CHECK(faultline_scheduler_report(&scheduler, 7, &started, 12) == FAULTLINE_SCHEDULER_OK);
+        if (next_worker == 7) {
+            /* A task error can retry on the same live worker: only the attempt changes. */
+            const struct faultline_message failed = {.message_type = FAULTLINE_MSG_JOB_FAILED,
+                .payload.job_failed = {.identity = {id, 7, 1}, .failure = FAULTLINE_JOB_FAILURE_TASK}};
+            CHECK(faultline_scheduler_report(&scheduler, 7, &failed, 13) == FAULTLINE_SCHEDULER_OK);
+        } else {
+            CHECK(faultline_scheduler_worker_lost(&scheduler, 7, 13) == FAULTLINE_SCHEDULER_OK);
+        }
+        CHECK(faultline_scheduler_find(&scheduler, id)->state == FAULTLINE_JOB_QUEUED);
+        CHECK(scheduler.pending.count == 1);
+        CHECK(reject_old_reports(id, 14) == EXIT_SUCCESS);
+
+        CHECK(faultline_scheduler_assign(&scheduler, next_worker, 15, &assignment) == FAULTLINE_SCHEDULER_OK);
+        CHECK(faultline_scheduler_find(&scheduler, id)->state == FAULTLINE_JOB_ASSIGNED);
+        CHECK(assignment.payload.job_assign.identity.attempt == 2);
+        CHECK(reject_old_reports(id, 16) == EXIT_SUCCESS);
+        started.payload.job_started = assignment.payload.job_assign.identity;
+        CHECK(faultline_scheduler_report(&scheduler, next_worker, &started, 17) == FAULTLINE_SCHEDULER_OK);
+        CHECK(faultline_scheduler_find(&scheduler, id)->state == FAULTLINE_JOB_RUNNING);
+        CHECK(reject_old_reports(id, 18) == EXIT_SUCCESS);
+
+        const struct faultline_message completed = {.message_type = FAULTLINE_MSG_JOB_COMPLETED,
+            .payload.job_completed = {.identity = {id, next_worker, 2},
+                                     .result_size = 3, .result = {'N', 'E', 'W'}}};
+        CHECK(faultline_scheduler_report(&scheduler, next_worker, &completed, 19) == FAULTLINE_SCHEDULER_OK);
+        CHECK(reject_old_reports(id, 20) == EXIT_SUCCESS);
+        const struct faultline_job *job = faultline_scheduler_find(&scheduler, id);
+        CHECK(job->state == FAULTLINE_JOB_DONE && job->worker_id == next_worker);
+        CHECK(job->attempt == 2 && job->retry_count == 1 && scheduler.pending.count == 0);
+        CHECK(job->result_size == 3 && memcmp(job->result, "NEW", 3) == 0);
+    }
+    return EXIT_SUCCESS;
+}
+
 static int test_capacity_and_retry_room(void)
 {
     uint64_t id = 0;
@@ -183,6 +248,7 @@ int main(void)
         {"FIFO assignment and immediate worker reservation", test_fifo_reservation},
         {"validated reports, retained results, and worker reuse", test_reports_and_idle_worker},
         {"retry ordering, stale attempts, and worker loss", test_retry_order_and_stale_attempt},
+        {"old reports preserve retry state and accepted results", test_old_reports_preserve_retry_and_result},
         {"bounded store and guaranteed retry queue room", test_capacity_and_retry_room},
         {"job ID exhaustion and rejected scheduler inputs", test_id_exhaustion_and_invalid_inputs}
     };
