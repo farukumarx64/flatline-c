@@ -1,6 +1,7 @@
 """Recover real running jobs after worker failure, using the real CLI and workers."""
 
 import argparse
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import re
@@ -335,6 +336,103 @@ class OldAttemptRecoveryTests(RecoveryTestCase):
 
     def test_resumed_worker_cannot_overwrite_completed_retry(self):
         self.check_resumed_worker(resume_after_completion=True)
+
+
+class RetryExhaustionTests(RecoveryTestCase):
+    def check_worker_loss_exhaustion(self, max_retries):
+        # One worker per allowed attempt, plus a healthy spare. Available
+        # capacity must not turn an exhausted job into another assignment.
+        with ExitStack() as stack:
+            workers = {}
+            for _ in range(max_retries + 2):
+                worker = stack.enter_context(self.worker_process(interval_ms=100))
+                process, output, errors = worker
+                worker_id = self.wait_for_registration(process, output, errors)
+                self.assertNotIn(worker_id, workers)
+                self.wait_for_worker_event('heartbeat_received', worker_id)
+                workers[worker_id] = worker
+
+            # Long enough that every attempt must be interrupted, not finish
+            # while the harness is checking registrations or logs.
+            job_id = self.accepted_id(self.submit_cli('sleep', '--args', '60000',
+                                                      '--max-retries', str(max_retries)))
+            expected = [('job_submitted', 'QUEUED', '0', '0', '0', '1')]
+            interrupted = []
+            for attempt in range(1, max_retries + 2):
+                started = self.wait_transition(job_id, 'job_started', state='RUNNING',
+                                               attempt=attempt, retry_count=attempt - 1,
+                                               pending=0, result_bytes=0)
+                owner_id = int(started['worker_id'])
+                self.assertIn(owner_id, workers)
+                self.assertNotIn(owner_id, interrupted)
+                owner, owner_output, owner_errors = workers[owner_id]
+                self.wait_next_heartbeat(owner_id, owner)
+                self.assertEqual(self.job_events(job_id)[-1], started)
+
+                owner.send_signal(signal.SIGKILL)
+                self.assertEqual(owner.wait(timeout=2), -signal.SIGKILL,
+                                 read_output(owner_errors))
+                self.assertEqual(read_output(owner_errors), '')
+                self.assertNotIn('job_completed_sent', read_output(owner_output))
+                self.assertNotIn('job_failed_sent', read_output(owner_output))
+                interrupted.append(owner_id)
+
+                exhausted = attempt == max_retries + 1
+                state = 'FAILED' if exhausted else 'QUEUED'
+                # Terminal records retain the last owner for history; only
+                # requeued records release ownership back to zero.
+                recorded_owner = owner_id if exhausted else 0
+                retries = max_retries if exhausted else attempt
+                pending = 0 if exhausted else 1
+                self.wait_transition(job_id, 'job_worker_lost', state=state,
+                                     worker_id=recorded_owner, attempt=attempt,
+                                     retry_count=retries, pending=pending, result_bytes=0)
+                dead = self.wait_for_worker_event('worker_dead', owner_id)
+                self.assertEqual(dead['state'], 'DEAD')
+                self.assertIn(dead['reason'], ('eof', 'recv_error', 'truncated_message'))
+                self.assertEqual(self.worker_events('heartbeat_timeout', owner_id), [])
+                expected.extend([
+                    ('job_assigned', 'ASSIGNED', str(owner_id), str(attempt), str(attempt - 1), '0'),
+                    ('job_started', 'RUNNING', str(owner_id), str(attempt), str(attempt - 1), '0'),
+                    ('job_worker_lost', state, str(recorded_owner), str(attempt), str(retries), str(pending)),
+                ])
+
+            failed_events = self.job_events(job_id)
+            transitions = [(entry['event'], entry['state'], entry['worker_id'],
+                            entry['attempt'], entry['retry_count'], entry['pending'])
+                           for entry in failed_events]
+            self.assertEqual(transitions, expected)
+            survivor_id, = workers.keys() - set(interrupted)
+            survivor, survivor_output, survivor_errors = workers[survivor_id]
+            self.assertIsNone(survivor.poll())
+
+            # Exercise actual scheduler progress after exhaustion. An extra
+            # sleep retry would occupy the only live worker and block this job.
+            followup = self.accepted_id(self.submit_cli('fibonacci', '--args', '10'))
+            self.assertNotEqual(followup, job_id)
+            self.wait_transition(followup, 'job_completed', state='DONE',
+                                 worker_id=survivor_id, attempt=1, retry_count=0,
+                                 pending=0, result_bytes=2, result='"55"')
+            self.wait_next_heartbeat(survivor_id, survivor)
+            self.assert_pong(self.run_cli())
+            self.assertEqual(self.job_events(job_id), failed_events)
+            self.assertNotIn(f'worker job_assigned job_id={job_id} ', read_output(survivor_output))
+            self.assertEqual(self.worker_events('worker_dead', survivor_id), [])
+            for worker_id in workers:
+                self.assertEqual(len(self.worker_events('worker_registered', worker_id)), 1)
+            for worker_id in interrupted:
+                self.assertEqual(len(self.worker_events('worker_dead', worker_id)), 1)
+            print(f'job {job_id}: max_retries={max_retries}; SIGKILL workers {interrupted}; '
+                  f'FAILED at attempt {max_retries + 1}, retry_count={max_retries}, pending=0; '
+                  f'no further assignment; worker {survivor_id} completed follow-up job {followup}=55',
+                  flush=True)
+            self.stop_worker(survivor, survivor_errors)
+
+    def test_repeated_worker_crashes_exhaust_two_retries(self):
+        self.check_worker_loss_exhaustion(max_retries=2)
+
+    def test_zero_retries_fails_after_first_worker_crash(self):
+        self.check_worker_loss_exhaustion(max_retries=0)
 
 
 if __name__ == '__main__':
