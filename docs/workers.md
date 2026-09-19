@@ -165,6 +165,8 @@ active computation once connection loss is detected, but attempts can overlap.
 
 For busy-worker SIGKILL or SIGSTOP/heartbeat recovery, with the job completed by
 another connected worker, run `make test-recovery`; see [worker recovery](recovery.md).
+That suite also resumes the expired worker with SIGCONT during and after the retry,
+checking that the original process cannot change current job state or the saved result.
 The detection scenarios below focus on registration/connection liveness.
 
 Failure detection has two inputs: a socket reporting disconnection and a worker

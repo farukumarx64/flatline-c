@@ -195,10 +195,12 @@ work; [tasks.md](tasks.md) explains synchronization and result formatting.
 
 ## Tests
 
-`tests/test_scheduler.c` adds six deterministic groups: atomic acceptance and
+`tests/test_scheduler.c` adds seven deterministic groups: atomic acceptance and
 ownership, FIFO reservation and busy rejection, valid reports and worker reuse,
-retry order and stale attempts, capacity with guaranteed retry room, and ID
-exhaustion/invalid inputs. Failed operations are checked against snapshots.
+retry order and stale attempts, old-report rejection across retry states and after
+completion, capacity with guaranteed retry room, and ID exhaustion/invalid inputs.
+Failed operations are checked against snapshots. The [recovery tests](recovery.md)
+also resume expired workers before and after their replacement completes the job.
 
 `tests/integration/test_scheduling.py` uses a fresh coordinator for each of its
 15 scenarios. It covers real CLI and worker processes, concurrent submissions,

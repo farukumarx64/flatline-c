@@ -7,12 +7,12 @@ make test
 make test-sanitize
 ```
 
-These run 66 protocol, registry, job, queue, scheduler, task, and socket C test groups plus process integration
+These run 67 protocol, registry, job, queue, scheduler, task, and socket C test groups plus process integration
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
-Use `make test-recovery` for SIGKILL and SIGSTOP/heartbeat recovery of running jobs
-onto already-connected workers, or `make SANITIZE=1 test-recovery` for instrumented binaries.
+Use `make test-recovery` for SIGKILL, SIGSTOP/heartbeat recovery, and resumed-worker
+old-attempt protection, or `make SANITIZE=1 test-recovery` for instrumented binaries.
 Use `make test-execution` for built-in results, heartbeats during computation,
 worker reuse, and cancellation, or `make SANITIZE=1 test-execution` for instrumented binaries.
 Use `make test-scheduling` for CLI submission and scheduling, or
@@ -148,11 +148,18 @@ Application code must keep authoritative records in its own store. Queue code
 links into the coordinator and its test binary; the queue tests also link the
 job model to exercise assignment and retry ordering.
 
-`test_scheduler.c` adds six groups covering atomic store/queue acceptance,
+`test_scheduler.c` adds seven groups covering atomic store/queue acceptance,
 unique IDs and owned arguments, immediate busy reservation, FIFO dispatch,
 validated reports and result retention, worker release, retry ordering and old
 attempt rejection, worker loss, full-store rejection with guaranteed retry room,
 and ID exhaustion. Rejected operations preserve scheduler/output snapshots.
+
+The old-report group injects attempt-1 STARTED, COMPLETED, and FAILED reports
+while the job is QUEUED, ASSIGNED to attempt 2, RUNNING on attempt 2, or DONE.
+It tests retries on the same worker after a task error and on a different worker
+after worker loss. Each of the 24 rejected reports must preserve the full
+scheduler snapshot, including the queue, timestamps, retries, and accepted result.
+Old/new completion payloads differ so a result overwrite cannot pass silently.
 
 `integration/test_scheduling.py` adds 15 scenarios, with a fresh coordinator per
 test to isolate retained job records:
@@ -212,7 +219,7 @@ and CPU tasks remain active beyond that timeout, so continuing heartbeats are
 required to keep their assignments alive. Algorithm/input contracts are in
 [the task guide](../docs/tasks.md).
 
-`integration/test_recovery.py` contains two acceptance scenarios, each with a
+`integration/test_recovery.py` contains four acceptance scenarios, each with a
 fresh coordinator and two real workers. In the hard-crash check, both register and heartbeat
 before CLI submission. After a three-second sleep job starts and its owner sends
 another heartbeat, the harness kills that owner with SIGKILL. It verifies prompt
@@ -238,8 +245,20 @@ The connected survivor completes attempt 2 with the expected result, then a new
 Fibonacci job. The original worker remains paused through both completions and
 sends no terminal report. A finally block kills and reaps that child after the
 checks or on failure; this cleanup cannot trigger a passing recovery. The test
-does not resume the old attempt. Both scenarios share log parsing, bounded
+does not resume the old attempt. The scenarios share log parsing, bounded
 attempt-aware waits, and exact transition-sequence assertions in `RecoveryTestCase`.
+
+Two additional scenarios resume the original worker with SIGCONT after expiry:
+one while attempt 2 is RUNNING and one after it is DONE. They require the same old
+process to exit with a connection error, without changing the original job's
+event history or renewing its expired heartbeat. The survivor's identity, result,
+heartbeats, and ability to complete follow-up work remain intact. Cleanup kills
+and reaps the old child only if it is still present, including after a failed test.
+
+Local completion-send logs from the resumed worker are diagnostic, not acceptance
+evidence: the closed connection may fail before a report is generated or before
+it reaches the coordinator. The C scheduler matrix above independently forces
+old-report validation and checks that state remains unchanged.
 
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
 Its original 15 scenarios cover a successful exchange and sequential clients, default
@@ -360,5 +379,5 @@ make test-sanitize INTEGRATION_ARGS='--port 9000'
 When 9000 is selected, the harness starts the coordinator without `--port` and
 also invokes `faultline ping` and `faultline-worker` without `--coordinator`
 to test all defaults. Processes started by the harness are stopped afterward.
-With automatic port selection, the suite discovers 73 scenarios: 71 run and two
+With automatic port selection, the suite discovers 75 scenarios: 73 run and two
 default-port checks are skipped. Persistent recovery is not implemented or tested yet.

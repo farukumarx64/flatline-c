@@ -1,9 +1,11 @@
 # Worker failure recovery
 
-Two fault-tolerance acceptance checks interrupt a real busy worker and verify
+Four fault-tolerance acceptance checks interrupt a real busy worker and verify
 that another already-connected worker completes its job. SIGKILL exercises
 connection-loss recovery; SIGSTOP exercises heartbeat expiry while the worker
 process remains paused and keeps its socket open until the coordinator closes it.
+Two further scenarios resume that expired worker while its retry is running or
+after its retry has completed, checking that the current job remains unchanged.
 The coordinator, both workers, and the submission CLI are the actual executables.
 
 ## Run the checks
@@ -18,7 +20,7 @@ It selects an available loopback port, starts its own coordinator and workers,
 captures their logs, and cleans up the processes afterward. Each scenario uses
 a fresh coordinator. Signals target only the test's own worker child processes.
 
-Both checks are also included in `make test-integration`, `make test`, and
+All four checks are also included in `make test-integration`, `make test`, and
 `make test-sanitize`. The existing `INTEGRATION_ARGS='--port 9000'` option works
 when that port is available.
 
@@ -110,7 +112,69 @@ The paused worker is deliberately not resumed in this scenario. A `finally`
 block kills and reaps that test-owned process after verification, or after a
 test failure, because a stopped process cannot handle SIGTERM. On a passing run,
 this cleanup happens after recovery and completion; it cannot be the event that
-caused reassignment. Resuming an old attempt remains the next separate check.
+caused reassignment. The separate scenarios below exercise resuming the old attempt.
+
+## Resuming an expired attempt
+
+`OldAttemptRecoveryTests` adds two scenarios using the same real coordinator,
+workers, CLI, three-second sleep, and default six-second timeout. Both register
+two workers, wait for attempt 1 to start, pause its owner with SIGSTOP, and wait
+for heartbeat expiry and reassignment to the connected survivor.
+
+The old process is then resumed with SIGCONT at one of two points:
+
+| Resume point | What must be protected |
+| --- | --- |
+| Attempt 2 is RUNNING | Current ownership, attempt, retry count, and running state |
+| Attempt 2 is DONE | The accepted result and terminal state, as well as identity |
+
+The harness snapshots the original job's complete event history immediately
+before SIGCONT and checks that it is unchanged when the old worker exits. The
+RUNNING case explicitly requires the retry to still be RUNNING at this point;
+the DONE case includes the stored `slept_ms=3000` result. After attempt 2 completes,
+a follow-up Fibonacci job must return `55` from the survivor, with no further
+events for the original job.
+
+The resumed process keeps its old socket, worker ID, and attempt-1 assignment.
+Expiry has already removed that connection from the coordinator's event loop.
+On resuming, the worker encounters the closed connection and exits with status 1.
+The test requires a connection-related error, not termination by a cleanup signal.
+Its previously accepted heartbeat history must remain unchanged, with exactly
+one old-worker registration, one timeout, and one death. The survivor retains its
+own registration, continues heartbeating, and the CLI still receives PONG.
+
+Thread scheduling determines whether the old task finishes before the networking
+thread detects the closed connection. A local socket send can also succeed without
+the coordinator accepting the report. The test prints `old_local_completion_send`
+as diagnostic information, but neither requires nor forbids a local completion
+log. Its assertions use coordinator events. It does not claim that every run
+delivers an outdated completion into the coordinator's report handler.
+
+To exercise that handler's underlying validation independently of this race,
+`tests/test_scheduler.c` also adds a direct C test group. It passes old STARTED,
+COMPLETED, and FAILED reports to the scheduler in each of these states:
+
+- QUEUED after the first attempt failed or its worker was lost.
+- ASSIGNED to attempt 2.
+- RUNNING on attempt 2.
+- DONE with attempt 2's accepted result.
+
+It runs this matrix for a task-error retry on the same worker ID and for a
+worker-loss retry on a different worker ID: 24 rejected reports in total. The
+same-worker case checks why the attempt number is necessary even when worker
+identity matches. The old completion carries `OLD`, while the accepted completion
+carries `NEW`, so an overwrite would be visible. Every rejected call must leave
+the entire scheduler snapshot unchanged, including records, timestamps, retry
+counters, result bytes, ID allocation state, and the FIFO.
+
+Together these checks cover the closed-connection boundary and state/identity
+validation. The current wire format already carries job ID, worker ID, and attempt;
+no new message, field, or production C change was required.
+
+Each real-worker scenario has a finally block that kills and reaps the old child
+if it is still present after a failure, including if it is still stopped. On a
+passing run the resumed worker has already exited by itself. SIGCONT resumes the
+old process; it does not restore its expired registration or ownership.
 
 ## Expected state changes
 
@@ -156,13 +220,13 @@ ownership; [task execution](tasks.md) explains the worker's computation and repo
 
 ## Scope of this step
 
-These checks verify crash and heartbeat-based recovery while the coordinator
-remains alive. Jobs and results are still in memory; coordinator restart recovery
+These checks verify crash, heartbeat-based recovery, and old-attempt protection
+while the coordinator remains alive. Jobs and results are still in memory; coordinator restart recovery
 needs the future WAL. The system retains at-least-once semantics: each test asserts
 one accepted result for its scenario, not a guarantee that every task executes
 only once.
 
-The next separate checks are protection against an old attempt after a paused
-worker resumes, and repeated worker losses exhausting the retry allowance.
-Existing tests cover parts of
-those mechanisms; their combined fault-tolerance scenarios remain later steps.
+The next separate check is repeated worker losses exhausting the retry allowance.
+Existing tests cover retry limits at the model/scheduler level and task-error
+exhaustion with real workers; repeated worker-loss exhaustion remains the next
+fault-tolerance acceptance scenario.

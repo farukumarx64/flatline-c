@@ -151,6 +151,8 @@ acceptance guarantees, worker eligibility, retries, and the current limits.
 pause it with SIGSTOP until its heartbeat expires. In both cases, an
 already-connected worker completes the same job on attempt 2 and remains
 available for another job.
+Additional checks resume the expired worker while attempt 2 is running or after
+it completes, verifying that the current assignment and accepted result stay intact.
 
 ## Tests
 
@@ -164,7 +166,7 @@ the real executables. `test-sanitize` instruments all C programs under test.
 Use `make test-unit` or `make test-integration` to run either layer separately.
 Use `make test-scheduling` for CLI submission and scheduling scenarios.
 Use `make test-execution` for task results, concurrent workers, and cancellation.
-Use `make test-recovery` for hard-crash and heartbeat-based recovery of running jobs, or
+Use `make test-recovery` for crash/heartbeat recovery and resumed-worker protection, or
 `make SANITIZE=1 test-recovery` for the sanitizer build.
 Use `make test-failures` to run only the five failure-detection scenarios, or
 `make SANITIZE=1 test-failures` to run them with AddressSanitizer/UBSan.
