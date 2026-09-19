@@ -11,8 +11,9 @@ These run 67 protocol, registry, job, queue, scheduler, task, and socket C test 
 tests using Python 3's standard library. A loopback-capable environment is
 required. You can select the Python interpreter with `PYTHON=/path/to/python3`.
 Use `make test-unit` or `make test-integration` to run one layer separately.
-Use `make test-recovery` for SIGKILL, SIGSTOP/heartbeat recovery, and resumed-worker
-old-attempt protection, or `make SANITIZE=1 test-recovery` for instrumented binaries.
+Use `make test-recovery` for SIGKILL, SIGSTOP/heartbeat recovery, resumed-worker
+old-attempt protection, and retry exhaustion, or `make SANITIZE=1 test-recovery`
+for instrumented binaries.
 Use `make test-execution` for built-in results, heartbeats during computation,
 worker reuse, and cancellation, or `make SANITIZE=1 test-execution` for instrumented binaries.
 Use `make test-scheduling` for CLI submission and scheduling, or
@@ -219,8 +220,8 @@ and CPU tasks remain active beyond that timeout, so continuing heartbeats are
 required to keep their assignments alive. Algorithm/input contracts are in
 [the task guide](../docs/tasks.md).
 
-`integration/test_recovery.py` contains four acceptance scenarios, each with a
-fresh coordinator and two real workers. In the hard-crash check, both register and heartbeat
+`integration/test_recovery.py` contains six acceptance scenarios, each with a
+fresh coordinator and real workers. In the hard-crash check, both register and heartbeat
 before CLI submission. After a three-second sleep job starts and its owner sends
 another heartbeat, the harness kills that owner with SIGKILL. It verifies prompt
 transport-based detection, one requeue, the same job ID assigned to the connected
@@ -259,6 +260,24 @@ Local completion-send logs from the resumed worker are diagnostic, not acceptanc
 evidence: the closed connection may fail before a report is generated or before
 it reaches the coordinator. The C scheduler matrix above independently forces
 old-report validation and checks that state remains unchanged.
+
+Two retry-exhaustion scenarios submit a 60-second sleep with allowances of two
+and zero retries. All workers register and heartbeat before submission: one per
+allowed attempt, plus a healthy spare. The harness waits for each attempt's
+RUNNING event and a fresh owner heartbeat, then kills that owner with SIGKILL.
+Every lost owner must be distinct, with one transport-related death and no
+heartbeat timeout or worker-sent terminal report. The six-second coordinator
+timeout stays unchanged; loss events have a two-second observation deadline.
+
+With two retries, the first two losses requeue the same job; the third produces
+FAILED with `attempt=3`, `retry_count=2`, the last owner ID, no result, and no
+pending job. With zero retries, the first loss produces FAILED with `attempt=1`
+and `retry_count=0`. Both scenarios compare the entire expected transition
+sequence. The spare must complete a new Fibonacci job with result `55`, keep
+heartbeating, and never receive the failed job. The failed job's event history
+must stay unchanged while this follow-up work completes and the CLI gets PONG. These
+assertions detect extra retries despite available capacity and a blocked queue.
+An `ExitStack` cleans up every worker fixture, including after failed assertions.
 
 `integration/test_ping.py` starts the real coordinator and invokes the real CLI.
 Its original 15 scenarios cover a successful exchange and sequential clients, default
@@ -367,7 +386,7 @@ The focused command prints each detected reason and elapsed observation time or
 heartbeat silence duration. The full integration target includes this suite once.
 
 By default, suites select available ports. The original coordinator and worker
-suites each skip one default-endpoint check. To run all 44 scenarios, stop any existing
+suites each skip one default-endpoint check. To run all 77 scenarios, stop any existing
 coordinator on port 9000 and run:
 
 ```sh
@@ -379,5 +398,5 @@ make test-sanitize INTEGRATION_ARGS='--port 9000'
 When 9000 is selected, the harness starts the coordinator without `--port` and
 also invokes `faultline ping` and `faultline-worker` without `--coordinator`
 to test all defaults. Processes started by the harness are stopped afterward.
-With automatic port selection, the suite discovers 75 scenarios: 73 run and two
+With automatic port selection, the suite discovers 77 scenarios: 75 run and two
 default-port checks are skipped. Persistent recovery is not implemented or tested yet.

@@ -1,12 +1,14 @@
 # Worker failure recovery
 
-Four fault-tolerance acceptance checks interrupt a real busy worker and verify
-that another already-connected worker completes its job. SIGKILL exercises
-connection-loss recovery; SIGSTOP exercises heartbeat expiry while the worker
+Six fault-tolerance acceptance checks exercise recovery and retry limits with
+real busy workers. SIGKILL exercises connection-loss recovery; SIGSTOP exercises
+heartbeat expiry while the worker
 process remains paused and keeps its socket open until the coordinator closes it.
-Two further scenarios resume that expired worker while its retry is running or
+Two scenarios resume that expired worker while its retry is running or
 after its retry has completed, checking that the current job remains unchanged.
-The coordinator, both workers, and the submission CLI are the actual executables.
+Two more interrupt every allowed attempt, checking that the job becomes FAILED
+and stays out of the queue even when another worker is available. The coordinator,
+workers, and submission CLI are the actual executables.
 
 ## Run the checks
 
@@ -20,7 +22,7 @@ It selects an available loopback port, starts its own coordinator and workers,
 captures their logs, and cleans up the processes afterward. Each scenario uses
 a fresh coordinator. Signals target only the test's own worker child processes.
 
-All four checks are also included in `make test-integration`, `make test`, and
+All six checks are also included in `make test-integration`, `make test`, and
 `make test-sanitize`. The existing `INTEGRATION_ARGS='--port 9000'` option works
 when that port is available.
 
@@ -176,7 +178,7 @@ if it is still present after a failure, including if it is still stopped. On a
 passing run the resumed worker has already exited by itself. SIGCONT resumes the
 old process; it does not restore its expired registration or ownership.
 
-## Expected state changes
+## Expected state changes for a successful retry
 
 Let J be the submitted job, A its original worker, and B the connected survivor:
 
@@ -200,6 +202,66 @@ and one registration for B. B keeps its original process and identity; no
 replacement worker is launched after the crash. Missing or duplicate transitions
 for J fail the check.
 
+## Retry-exhaustion scenarios
+
+`RetryExhaustionTests` checks two retry allowances: two retries and zero retries.
+The allowance counts **additional attempts after the original attempt**. Thus
+`--max-retries 2` permits three total attempts; `--max-retries 0` permits just one.
+The retry counter increases when the coordinator requeues a job. It does not
+increase on the final failure because no further retry is granted.
+
+For the two-retry case, the harness starts four workers with 100 ms heartbeat
+intervals and waits for every registration and heartbeat before submitting
+`sleep --args 60000 --max-retries 2`. Three workers will be interrupted, leaving
+one healthy spare. The long sleep keeps attempts busy during the checks; a passing
+test kills each attempt promptly and does not wait a minute for it to complete.
+
+For each attempt, the test waits for the coordinator's RUNNING event and another
+heartbeat from its owner. It discovers that owner from the event rather than
+assuming worker launch order. It then sends SIGKILL and requires the child to exit
+because of that signal, with no completion or task-failure report. The coordinator
+must record one transport-related death for that worker and no heartbeat timeout.
+The coordinator retains its default six-second heartbeat timeout, while each
+expected job-loss transition has a two-second observation deadline.
+
+The same job ID passes through these outcomes:
+
+| Interrupted attempt | Retry count before loss | State after loss | Retry count after loss | Pending jobs |
+| --- | --- | --- | --- | --- |
+| 1: original attempt | 0 | QUEUED | 1 | 1 |
+| 2: first retry | 1 | QUEUED | 2 | 1 |
+| 3: second retry | 2 | FAILED | 2 | 0 |
+
+Every retry is assigned to a different already-connected worker, moves through
+ASSIGNED and RUNNING, and executes the same job from the beginning. The harness
+checks the complete sequence, including submission, all three assignments/starts,
+and all three loss events. Missing, duplicate, or extra transitions fail the test.
+The final event is `job_worker_lost` with `state=FAILED`: this is a coordinator
+decision after connection loss, not a worker-sent `JOB_FAILED` message.
+
+The terminal record retains the last worker ID and attempt as history. Queued
+records clear the worker ID to zero. Keeping the last owner on a FAILED record
+does not reserve a worker or make the job eligible for scheduling; active ownership
+only applies to ASSIGNED/RUNNING jobs. There is no result for this failed job.
+
+The healthy spare makes the stop condition observable: a lack of workers cannot
+explain why the job stopped retrying. After the final failure, the harness submits
+`fibonacci --args 10` and requires that spare to complete it with result `55`.
+It then observes another heartbeat and a successful CLI PING/PONG. The failed
+job's event history must remain unchanged, and the spare must never receive it.
+An erroneous fourth sleep attempt would occupy the only live worker and prevent
+the follow-up job from completing within its deadline.
+
+The zero-retry case repeats the same checks with two workers. Losing the first
+attempt immediately produces FAILED with `attempt=1`, `retry_count=0`, and an
+empty queue. The remaining worker completes the follow-up job. This boundary
+case catches accidentally granting an extra retry when the allowance is zero.
+
+`contextlib.ExitStack` manages the variable number of worker fixtures and closes
+all of them if an assertion fails. Every deliberately killed child is waited on;
+the spare shuts down normally after the checks. Each scenario has a fresh
+coordinator and uses bounded waits for observed events.
+
 ## Existing implementation exercised
 
 These acceptance checks required no changes to the C recovery implementation:
@@ -210,23 +272,30 @@ These acceptance checks required no changes to the C recovery implementation:
   that same cleanup path with reason `heartbeat_timeout`.
 - `src/coordinator/scheduler.c`: `faultline_scheduler_worker_lost()` applies
   WORKER_LOST to the active job and publishes the resulting queue/state update.
-- `src/coordinator/job.c`: the model enforces the retry allowance, clears queued
-  ownership, and increments the attempt on the next assignment.
+- `src/coordinator/job.c`: the model requeues only while `retry_count < max_retries`,
+  clearing queued ownership and incrementing the retry counter. Otherwise it
+  records FAILED and the finish time. The next assignment increments the attempt.
 - The scheduler selects the oldest queued job for an eligible idle worker.
-- The survivor executes the task and sends its normal STARTED/COMPLETED reports.
+- Only QUEUED outcomes go back into the FIFO; exhausted FAILED jobs stay in the
+  job store as terminal records.
+- Healthy workers execute recovered or follow-up tasks and send normal
+  STARTED/COMPLETED reports.
 
 The existing [scheduling guide](scheduling.md) explains validation and queue
 ownership; [task execution](tasks.md) explains the worker's computation and reporting.
 
 ## Scope of this step
 
-These checks verify crash, heartbeat-based recovery, and old-attempt protection
-while the coordinator remains alive. Jobs and results are still in memory; coordinator restart recovery
-needs the future WAL. The system retains at-least-once semantics: each test asserts
-one accepted result for its scenario, not a guarantee that every task executes
-only once.
+These checks verify crash recovery, heartbeat-based recovery, old-attempt
+protection, and repeated worker-loss exhaustion while the coordinator remains
+alive. Existing model/scheduler tests also cover retry limits, and the execution
+suite checks exhaustion after task errors. The new exhaustion scenarios use
+SIGKILL; repeated heartbeat-expiry exhaustion is not a separate scenario here.
+Both detection paths use the same worker-loss operation.
 
-The next separate check is repeated worker losses exhausting the retry allowance.
-Existing tests cover retry limits at the model/scheduler level and task-error
-exhaustion with real workers; repeated worker-loss exhaustion remains the next
-fault-tolerance acceptance scenario.
+Jobs and results are still in memory; coordinator restart recovery needs the
+future WAL. The CLI reports submission acceptance, not the eventual result or
+terminal failure; these checks observe coordinator logs. At-least-once retry
+semantics permit repeated task execution, and a finite retry allowance can end
+in FAILED without a successful result. None of these checks guarantees that a
+task executes only once.
